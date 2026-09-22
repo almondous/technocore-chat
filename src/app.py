@@ -381,7 +381,8 @@ def _markdown_wanted(request: Request) -> bool:
     default stands. Once it is named, q decides — `text/markdown;q=0` is a refusal, and a
     markdown range listed after a lower-q plain one still wins.
     """
-    ranges = _accept_ranges(request.headers.get("accept", ""))
+    # Accept is a list field: preserve every field line and its order (RFC 9110 section 5.2).
+    ranges = _accept_ranges(",".join(request.headers.getlist("accept")))
     if not any(name == "text/markdown" for name, _ in ranges):
         return False
     markdown = _quality(ranges, "text/markdown")
