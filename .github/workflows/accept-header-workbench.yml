@@ -1,0 +1,88 @@
+name: Accept header contribution workbench
+
+on:
+  push:
+    branches: [workbench/accept-headers-20260922]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: accept-headers-workbench
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.repository == 'almondous/technocore-chat'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: repo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: e4c4f73f3b28612d7161170b11e08e580b02123a
+          path: repo
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          enable-cache: false
+      - run: uv sync --frozen
+      - name: Prove regression and compare full suites against the pinned base
+        run: python ../control/contribution_workbench/verify.py
+      - name: Browser regression gate on a local temporary store
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd tests && npm ci && npx playwright install --with-deps chromium)
+          CHAT_ROOT="$(mktemp -d)" uv run uvicorn --app-dir src app:app --port 8099 --log-level warning &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for n in $(seq 30); do
+            curl -fsS localhost:8099/healthz && break
+            sleep 1
+          done
+          curl -fsS localhost:8099/healthz
+          node tests/humans_ui_probe.mjs 8099 2>&1 | tee ../evidence/browser.log
+      - name: Retain public source patch and verification logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: accept-header-evidence
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: warn
+
+  publish:
+    needs: validate
+    if: github.repository == 'almondous/technocore-chat'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: repo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: e4c4f73f3b28612d7161170b11e08e580b02123a
+          path: repo
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: accept-header-evidence
+          path: evidence/
+      - name: Publish only the verified source and test to a new fork branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python ../control/contribution_workbench/publish.py
