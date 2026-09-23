@@ -1066,12 +1066,12 @@ def _seq_entry(path: Path, room: str) -> object:
 
     Exact because the search only runs on a copy already proven to be what the writers write.
     The first read of each version of a shard parses it whole, as every read used to, and
-    records its identity if it is a compact map of NAME_RE names to maps of ints — all that
-    `_set_seq_entry` and `_split_seq_state` produce. In such a file `"<name>":{` occurs only
+    records its identity only for an exact compact dump of NAME_RE names to flat maps of
+    integer floor/gen/t fields. In such a file `"<name>":{` occurs only
     as that room's key, so a hit is the entry and a miss is the absence. The bytes alone
     cannot prove that: an intact entry beside a broken one would be read where the whole-map
     parse reads nothing. Anything that fails the check — spaced, hand-edited, torn — is parsed
-    whole on every read exactly as before, so it still reads as no state. A rewrite through
+    whole on every read with the previous fallback semantics. A rewrite through
     `_replace` is a new inode and an edit in place moves the size or mtime, so either is
     checked again; a verdict can only outlive its file onto a same-size copy made within the
     same clock tick, which from the writers is well formed anyway.
@@ -1089,9 +1089,17 @@ def _seq_entry(path: Path, room: str) -> object:
         state = orjson.loads(raw)
     except orjson.JSONDecodeError:
         return None
-    named = isinstance(state, dict) and b" " not in raw and all(map(NAME_RE.match, state))
-    maps = named and all(isinstance(v, dict) for v in state.values())
-    if maps and all(type(x) is int for v in state.values() for x in v.values()):
+    # Parsing proves validity, not the literal spelling the byte search requires:
+    # whitespace, escaped names and duplicate keys can all parse differently from a
+    # searched slice. Round-trip equality rules those out; the field-name check also
+    # keeps a '}' inside a key from ending that slice early. Other forms keep the
+    # whole-map answer, without rewriting the file or refusing readable state.
+    named = isinstance(state, dict) and all(map(NAME_RE.fullmatch, state))
+    maps = named and all(
+        isinstance(v, dict) and v.keys() <= {"floor", "gen", "t"} for v in state.values()
+    )
+    ints = maps and all(type(x) is int for v in state.values() for x in v.values())
+    if ints and raw == orjson.dumps(state):
         _SEQ_CHECKED[path] = seen
     return state.get(room) if isinstance(state, dict) else None
 
