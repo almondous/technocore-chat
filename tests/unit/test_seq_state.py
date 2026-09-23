@@ -204,6 +204,82 @@ def test_a_generation_survives_the_split_and_keeps_counting_up(tmp_path) -> None
     assert store.last_seq(tmp_path, "gone") == 41, "the pre-split floor was not carried over"
 
 
+def _refuse_whole_shards(path: Path) -> dict:
+    """Stands in for `_read_seq_state`: the pre-shard fallback may run — it is one failed open —
+    but no shard may be parsed in full to answer for a single room."""
+    if path.name != ".seqstate":
+        pytest.fail(f"built all of {path.name} to read one entry")
+    return {}
+
+
+def test_a_read_finds_its_entry_without_building_the_shard(tmp_path, monkeypatch) -> None:
+    """The cost claim one level down. A live shard holds thousands of entries, and parsing one
+    to read a single entry was 3.2 ms per ask and 71% of all GIL time — every room read and
+    every long-poll tick asks. A compact shard must answer a hit and a miss from its bytes,
+    wherever in the file the entry sits."""
+    import store
+
+    rooms = {f"r{i}": {"floor": i, "gen": i % 7 + 1, "t": 1} for i in range(2_000)}
+    shards: dict[Path, dict] = {}
+    for room, entry in rooms.items():
+        shards.setdefault(store._seq_state_path(tmp_path, room), {})[room] = entry
+    for path, group in shards.items():
+        path.write_bytes(orjson.dumps(group))
+
+    monkeypatch.setattr(store, "_read_seq_state", _refuse_whole_shards)
+    for room, entry in rooms.items():
+        assert store.room_generation(tmp_path, room) == entry["gen"], room
+        assert store.last_seq(tmp_path, room) == entry["floor"], room
+    assert store.room_generation(tmp_path, "never-made") == 0, "a miss is the absence"
+
+
+def test_what_the_writer_writes_the_search_finds(tmp_path, monkeypatch) -> None:
+    """The search leans on the writer's format, so the two are pinned together here: a create's
+    generation and a reap's floor, as `_set_seq_entry` records them, are read back from the
+    bytes. If the writer ever stops emitting compact `orjson`, this is what fails."""
+    import store
+
+    for room in ("lobby", "mb-inbox", "z9"):
+        store._write_record(tmp_path, room, "bot", "hi")
+    store._set_seq_entry(tmp_path, "z9", 17)  # a reap: the floor moves, the generation stays
+
+    monkeypatch.setattr(store, "_read_seq_state", _refuse_whole_shards)
+    for room in ("lobby", "mb-inbox", "z9"):
+        assert store.room_generation(tmp_path, room) == 1, room
+    assert store._seq_field(tmp_path, "z9", "floor") == 17
+
+
+def test_a_shard_in_any_other_form_is_still_read_in_full(tmp_path) -> None:
+    """The search is exact only for what `orjson.dumps` writes. A spaced or indented map — a
+    hand edit, `json.dumps` — must take the whole-map parse and answer the same, rather than
+    have a miss on the compact spelling believed as the room's absence."""
+    import json
+
+    import store
+
+    group = {"spaced": {"floor": 9, "gen": 4, "t": 1}, "other": {"floor": 1, "gen": 1, "t": 1}}
+    path = store._seq_state_path(tmp_path, "spaced")
+    for text in (json.dumps(group), json.dumps(group, indent=2)):
+        path.write_text(text)
+        assert store.room_generation(tmp_path, "spaced") == 4, text
+        assert store.last_seq(tmp_path, "spaced") == 9, text
+
+
+def test_a_shard_cut_off_mid_write_still_reads_as_never_existed(tmp_path) -> None:
+    """What the whole-map parse always made of a torn file, and still must: no state for any
+    room in it — including one whose own entry survived the cut intact, and one whose entry is
+    the part that broke inside an otherwise compact, closed map."""
+    import store
+
+    group = {"kept": {"floor": 5, "gen": 2, "t": 1}, "cut": {"floor": 6, "gen": 3, "t": 1}}
+    whole = orjson.dumps(group)
+    path = store._seq_state_path(tmp_path, "kept")
+    broken = b'{"kept":{"floor":5,"gen":},"cut":{}}'
+    for torn in (whole[:-1], whole[: whole.index(b'"cut"') + 9], broken):
+        path.write_bytes(torn)
+        assert store.room_generation(tmp_path, "kept") == 0, torn
+
+
 # --------------------------------------------------------------------------- isolation
 
 

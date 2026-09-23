@@ -1048,6 +1048,41 @@ def _read_seq_state(path: Path) -> dict:
     return state if isinstance(state, dict) else {}
 
 
+def _seq_entry(path: Path, room: str) -> object:
+    """`room`'s entry in one shard, found in the file's bytes rather than by parsing all of it.
+
+    A shard holds a few thousand rooms (~200 KB at a live deployment), and every room read
+    and every long-poll tick asks for one of them through `room_generation`. Building the
+    whole map to answer — thousands of dicts, keys and ints, allocated, collected and freed —
+    measured 3.2 ms per ask on the live box and 71% of all GIL time. The search is ~0.15 ms
+    including the read, and half the asks are misses (rooms older than the map, lobby among
+    them), so a miss had to be as cheap as a hit.
+
+    Exact, not a heuristic, because of what can be in the file. Only `orjson.dumps` of
+    `{name: {int fields}}` writes one (`_set_seq_entry`, `_split_seq_state`); a NAME_RE name
+    needs no JSON escaping; no value is an object. So `"<name>":{` occurs only as that room's
+    key, compact output holds no space byte, and a complete dump ends `}}`. When all three
+    are true a hit is the entry and a miss is the absence. Anything else — a spaced or
+    hand-edited file, a name NAME_RE refuses, a dump cut off mid-write — takes the whole-map
+    parse exactly as before, so junk and torn shards still read as no state. A future field
+    holding an object or a string breaks the first premise: route it through that parse.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if NAME_RE.match(room) and raw.endswith(b"}}") and b" " not in raw:
+        key = b'"' + room.encode() + b'":{'
+        at = raw.find(key)
+        if at < 0:
+            return None
+        try:
+            return orjson.loads(raw[at + len(key) - 1 : raw.find(b"}", at) + 1])
+        except orjson.JSONDecodeError:
+            pass
+    return _read_seq_state(path).get(room)
+
+
 def _seq_field(root: Path, room: str, key: str) -> int:
     """`room`'s `floor` or `gen`, always as a non-negative int.
 
@@ -1060,7 +1095,7 @@ def _seq_field(root: Path, room: str, key: str) -> int:
     Coerces here rather than at each caller: both fields are read on the request path, so a
     hand-edited or truncated map must degrade to 0 (never existed) and never raise.
     """
-    entry = _read_seq_state(_seq_state_path(root, room)).get(room)
+    entry = _seq_entry(_seq_state_path(root, room), room)
     if not isinstance(entry, dict):
         entry = _read_seq_state(_seq_state_path(root)).get(room)
     value = entry.get(key) if isinstance(entry, dict) else None
