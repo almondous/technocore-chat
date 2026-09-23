@@ -1048,6 +1048,12 @@ def _read_seq_state(path: Path) -> dict:
     return state if isinstance(state, dict) else {}
 
 
+# Shard -> the (inode, size, mtime) of the last copy a whole-map parse found to be exactly what
+# the writers write. A verdict about the file's form, never a copy of its data: every read
+# still reads the bytes, so nothing held here can go stale. See `_seq_entry`.
+_SEQ_CHECKED: dict[Path, tuple[int, int, int]] = {}
+
+
 def _seq_entry(path: Path, room: str) -> object:
     """`room`'s entry in one shard, found in the file's bytes rather than by parsing all of it.
 
@@ -1058,29 +1064,36 @@ def _seq_entry(path: Path, room: str) -> object:
     including the read, and half the asks are misses (rooms older than the map, lobby among
     them), so a miss had to be as cheap as a hit.
 
-    Exact, not a heuristic, because of what can be in the file. Only `orjson.dumps` of
-    `{name: {int fields}}` writes one (`_set_seq_entry`, `_split_seq_state`); a NAME_RE name
-    needs no JSON escaping; no value is an object. So `"<name>":{` occurs only as that room's
-    key, compact output holds no space byte, and a complete dump ends `}}`. When all three
-    are true a hit is the entry and a miss is the absence. Anything else — a spaced or
-    hand-edited file, a name NAME_RE refuses, a dump cut off mid-write — takes the whole-map
-    parse exactly as before, so junk and torn shards still read as no state. A future field
-    holding an object or a string breaks the first premise: route it through that parse.
+    Exact because the search only runs on a copy already proven to be what the writers write.
+    The first read of each version of a shard parses it whole, as every read used to, and
+    records its identity if it is a compact map of NAME_RE names to maps of ints — all that
+    `_set_seq_entry` and `_split_seq_state` produce. In such a file `"<name>":{` occurs only
+    as that room's key, so a hit is the entry and a miss is the absence. The bytes alone
+    cannot prove that: an intact entry beside a broken one would be read where the whole-map
+    parse reads nothing. Anything that fails the check — spaced, hand-edited, torn — is parsed
+    whole on every read exactly as before, so it still reads as no state. A rewrite through
+    `_replace` is a new inode and an edit in place moves the size or mtime, so either is
+    checked again; a verdict can only outlive its file onto a same-size copy made within the
+    same clock tick, which from the writers is well formed anyway.
     """
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as f:
+            st, raw = os.fstat(f.fileno()), f.read()
     except OSError:
         return None
-    if NAME_RE.match(room) and raw.endswith(b"}}") and b" " not in raw:
-        key = b'"' + room.encode() + b'":{'
-        at = raw.find(key)
-        if at < 0:
-            return None
-        try:
-            return orjson.loads(raw[at + len(key) - 1 : raw.find(b"}", at) + 1])
-        except orjson.JSONDecodeError:
-            pass
-    return _read_seq_state(path).get(room)
+    seen = (st.st_ino, st.st_size, st.st_mtime_ns)
+    if _SEQ_CHECKED.get(path) == seen and NAME_RE.match(room):
+        at = raw.find(key := b'"' + room.encode() + b'":{')
+        return orjson.loads(raw[at + len(key) - 1 : raw.find(b"}", at) + 1]) if at >= 0 else None
+    try:
+        state = orjson.loads(raw)
+    except orjson.JSONDecodeError:
+        return None
+    named = isinstance(state, dict) and b" " not in raw and all(map(NAME_RE.match, state))
+    maps = named and all(isinstance(v, dict) for v in state.values())
+    if maps and all(type(x) is int for v in state.values() for x in v.values()):
+        _SEQ_CHECKED[path] = seen
+    return state.get(room) if isinstance(state, dict) else None
 
 
 def _seq_field(root: Path, room: str, key: str) -> int:

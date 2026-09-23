@@ -204,19 +204,21 @@ def test_a_generation_survives_the_split_and_keeps_counting_up(tmp_path) -> None
     assert store.last_seq(tmp_path, "gone") == 41, "the pre-split floor was not carried over"
 
 
-def _refuse_whole_shards(path: Path) -> dict:
-    """Stands in for `_read_seq_state`: the pre-shard fallback may run — it is one failed open —
-    but no shard may be parsed in full to answer for a single room."""
-    if path.name != ".seqstate":
-        pytest.fail(f"built all of {path.name} to read one entry")
-    return {}
+def _parsed_sizes(monkeypatch) -> list[int]:
+    """Every `orjson.loads` from here on, by the size of what it was handed."""
+    import store
+
+    sizes: list[int] = []
+    real = store.orjson.loads
+    monkeypatch.setattr(store.orjson, "loads", lambda data: sizes.append(len(data)) or real(data))
+    return sizes
 
 
 def test_a_read_finds_its_entry_without_building_the_shard(tmp_path, monkeypatch) -> None:
     """The cost claim one level down. A live shard holds thousands of entries, and parsing one
     to read a single entry was 3.2 ms per ask and 71% of all GIL time — every room read and
-    every long-poll tick asks. A compact shard must answer a hit and a miss from its bytes,
-    wherever in the file the entry sits."""
+    every long-poll tick asks. Once a version of a shard has been checked, a hit and a miss
+    must both come from its bytes, wherever in the file the entry sits."""
     import store
 
     rooms = {f"r{i}": {"floor": i, "gen": i % 7 + 1, "t": 1} for i in range(2_000)}
@@ -225,28 +227,35 @@ def test_a_read_finds_its_entry_without_building_the_shard(tmp_path, monkeypatch
         shards.setdefault(store._seq_state_path(tmp_path, room), {})[room] = entry
     for path, group in shards.items():
         path.write_bytes(orjson.dumps(group))
+    for room in rooms:
+        store.room_generation(tmp_path, room)  # each shard's one whole parse, its check
 
-    monkeypatch.setattr(store, "_read_seq_state", _refuse_whole_shards)
+    sizes = _parsed_sizes(monkeypatch)
     for room, entry in rooms.items():
         assert store.room_generation(tmp_path, room) == entry["gen"], room
         assert store.last_seq(tmp_path, room) == entry["floor"], room
     assert store.room_generation(tmp_path, "never-made") == 0, "a miss is the absence"
+    assert max(sizes) < 100, f"parsed {max(sizes)} bytes to read one entry"
 
 
 def test_what_the_writer_writes_the_search_finds(tmp_path, monkeypatch) -> None:
     """The search leans on the writer's format, so the two are pinned together here: a create's
-    generation and a reap's floor, as `_set_seq_entry` records them, are read back from the
-    bytes. If the writer ever stops emitting compact `orjson`, this is what fails."""
+    generation and a reap's floor, as `_set_seq_entry` records them, pass the check and are
+    read back from the bytes. If the writer ever stops emitting compact `orjson` maps of ints,
+    this is what fails."""
     import store
 
     for room in ("lobby", "mb-inbox", "z9"):
         store._write_record(tmp_path, room, "bot", "hi")
     store._set_seq_entry(tmp_path, "z9", 17)  # a reap: the floor moves, the generation stays
+    for room in ("lobby", "mb-inbox", "z9"):
+        store.room_generation(tmp_path, room)
 
-    monkeypatch.setattr(store, "_read_seq_state", _refuse_whole_shards)
+    sizes = _parsed_sizes(monkeypatch)
     for room in ("lobby", "mb-inbox", "z9"):
         assert store.room_generation(tmp_path, room) == 1, room
     assert store._seq_field(tmp_path, "z9", "floor") == 17
+    assert max(sizes) < 100, f"parsed {max(sizes)} bytes to read one entry"
 
 
 def test_a_shard_in_any_other_form_is_still_read_in_full(tmp_path) -> None:
@@ -261,23 +270,41 @@ def test_a_shard_in_any_other_form_is_still_read_in_full(tmp_path) -> None:
     path = store._seq_state_path(tmp_path, "spaced")
     for text in (json.dumps(group), json.dumps(group, indent=2)):
         path.write_text(text)
-        assert store.room_generation(tmp_path, "spaced") == 4, text
-        assert store.last_seq(tmp_path, "spaced") == 9, text
+        for _ in range(2):  # the second read is the one a passed check would have searched
+            assert store.room_generation(tmp_path, "spaced") == 4, text
+            assert store.last_seq(tmp_path, "spaced") == 9, text
 
 
-def test_a_shard_cut_off_mid_write_still_reads_as_never_existed(tmp_path) -> None:
-    """What the whole-map parse always made of a torn file, and still must: no state for any
-    room in it — including one whose own entry survived the cut intact, and one whose entry is
-    the part that broke inside an otherwise compact, closed map."""
+def test_a_damaged_shard_reads_as_the_whole_map_parse_reads_it(tmp_path) -> None:
+    """Whatever the file, the answer is the whole-map parse's. A torn or broken one is no state
+    for every room in it — including one whose own entry is intact beside the break, which the
+    bytes alone cannot tell from a good file. One that parses but is not what the writers write
+    answers from the parse. Each is read twice, so a check wrongly passed would show."""
     import store
 
     group = {"kept": {"floor": 5, "gen": 2, "t": 1}, "cut": {"floor": 6, "gen": 3, "t": 1}}
     whole = orjson.dumps(group)
+    intact = b'{"kept":{"floor":5,"gen":2},'
+    torn = [whole[:-1], whole[: whole.index(b'"cut"') + 9], intact + b'"bad":{"gen":}}']
+    odd = [intact + b'"bad":{"gen":"x"}}', intact + b'"bad":7}']
     path = store._seq_state_path(tmp_path, "kept")
-    broken = b'{"kept":{"floor":5,"gen":},"cut":{}}'
-    for torn in (whole[:-1], whole[: whole.index(b'"cut"') + 9], broken):
-        path.write_bytes(torn)
-        assert store.room_generation(tmp_path, "kept") == 0, torn
+    for data, gen in [(t, 0) for t in torn] + [(o, 2) for o in odd]:
+        path.write_bytes(data)
+        for _ in range(2):
+            assert store.room_generation(tmp_path, "kept") == gen, data
+
+
+def test_a_checked_shard_edited_in_place_is_checked_again(tmp_path) -> None:
+    """The check is remembered per copy of the file, so an edit that keeps the inode — a hand
+    edit, a restore — must not inherit the verdict of the copy it replaced."""
+    import store
+
+    path = store._seq_state_path(tmp_path, "kept")
+    path.write_bytes(orjson.dumps({"kept": {"floor": 5, "gen": 2, "t": 1}}))
+    assert store.room_generation(tmp_path, "kept") == 2
+    assert store.room_generation(tmp_path, "kept") == 2, "premise: read from a checked copy"
+    path.write_bytes(b'{"kept":{"floor":5,"gen":2},"bad":{"gen":}}')
+    assert store.room_generation(tmp_path, "kept") == 0, "the broken copy inherited the check"
 
 
 # --------------------------------------------------------------------------- isolation
