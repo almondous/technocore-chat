@@ -1,0 +1,229 @@
+name: PR 890 compatibility verification
+
+# Fork-only bootstrap. The published fix is based directly on the pinned PR head;
+# this workflow is not included in that commit or proposed upstream.
+on:
+  push:
+    branches: [ci/pr890-seq-entry-compat-20260923]
+  workflow_dispatch:
+
+concurrency:
+  group: pr890-compat-verification
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    if: github.repository == 'almondous/technocore-chat'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          enable-cache: true
+
+      - name: Pin the original PR head and add regression tests
+        run: |
+          git switch --detach ef457d66bc5519b3930a46bf428fa45a78fd22f4
+          test "$(git rev-parse HEAD)" = ef457d66bc5519b3930a46bf428fa45a78fd22f4
+          python - <<'PY'
+          from pathlib import Path
+          test = Path('tests/unit/test_seq_entry_admission.py')
+          assert not test.exists()
+          test.write_text(r'''"""A seq-shard form must have the same meaning before and after a cached check."""
+
+          from pathlib import Path
+
+          import pytest
+
+
+          @pytest.mark.parametrize(
+              ("raw", "floor", "gen"),
+              [
+                  pytest.param(b'{"kept":\t{"floor":5,"gen":2,"t":1}}', 5, 2, id="tab-after-colon"),
+                  pytest.param(b'{"kept":\n{"floor":5,"gen":2,"t":1}}', 5, 2, id="lf-after-colon"),
+                  pytest.param(b'{"kept":\r{"floor":5,"gen":2,"t":1}}', 5, 2, id="cr-after-colon"),
+                  pytest.param(b'{"kept"\t:{"floor":5,"gen":2,"t":1}}', 5, 2, id="tab-before-colon"),
+                  pytest.param(br'{"\u006bept":{"floor":5,"gen":2,"t":1}}', 5, 2, id="escaped-room-key"),
+                  pytest.param(
+                      b'{"kept":{"floor":5,"gen":2,"t":1},"kept":{"floor":9,"gen":4,"t":2}}',
+                      9,
+                      4,
+                      id="duplicate-room-key-keeps-last-wins",
+                  ),
+                  pytest.param(
+                      b'{"kept":{"}":0,"floor":5,"gen":2,"t":1}}',
+                      5,
+                      2,
+                      id="brace-in-first-inner-key",
+                  ),
+                  pytest.param(
+                      b'{"kept":{"floor":5,"gen":2,"t":1,"}":0}}',
+                      5,
+                      2,
+                      id="brace-in-last-inner-key",
+                  ),
+              ],
+          )
+          def test_a_successful_parse_cannot_admit_a_different_warm_answer(
+              tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: bytes, floor: int, gen: int
+          ) -> None:
+              """Without any edit, cold and warm reads keep the whole parser's gen and floor.
+
+              JSON validity does not prove literal key spelling, unique keys, or safe object-end
+              delimiters. A byte form the search cannot read equivalently must keep the whole-map
+              fallback. Duplicate keys exercise the existing parser's last-wins compatibility,
+              not a format that writers should emit.
+              """
+              import store
+
+              monkeypatch.setattr(store, "_SEQ_CHECKED", {}, raising=False)
+              path = store._seq_state_path(tmp_path, "kept")
+              path.write_bytes(raw)
+              for attempt in range(3):
+                  assert store.room_generation(tmp_path, "kept") == gen, (attempt, raw)
+                  assert store.last_seq(tmp_path, "kept") == floor, (attempt, raw)
+              assert path.read_bytes() == raw, "read-only probes must not rewrite the shard"
+          ''', encoding='utf-8')
+          PY
+          uv sync --frozen
+          uv run python --version
+          uv run ruff format tests/unit/test_seq_entry_admission.py
+
+      - name: Require all eight regressions to fail on the unchanged PR head
+        run: |
+          set +e
+          uv run pytest tests/unit/test_seq_entry_admission.py -q --junitxml="$RUNNER_TEMP/pr890-red.xml" 2>&1 | tee "$RUNNER_TEMP/pr890-red.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 1
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = ET.parse(Path(os.environ['RUNNER_TEMP']) / 'pr890-red.xml').getroot()
+          suites = list(root.iter('testsuite'))
+          counts = {k: sum(int(s.get(k, '0')) for s in suites) for k in ('tests', 'failures', 'errors', 'skipped')}
+          print('RED_COUNTS', counts)
+          assert counts == {'tests': 8, 'failures': 8, 'errors': 0, 'skipped': 0}, counts
+          PY
+
+      - name: Confirm the regressions pass on the original whole-map implementation
+        run: |
+          cp src/store.py "$RUNNER_TEMP/pr890-before.py"
+          git show e4c4f73f3b28612d7161170b11e08e580b02123a:src/store.py > src/store.py
+          uv run pytest tests/unit/test_seq_entry_admission.py -q
+          cp "$RUNNER_TEMP/pr890-before.py" src/store.py
+
+      - name: Apply the narrowly scoped admission fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/store.py')
+          source = path.read_text(encoding='utf-8')
+          old = '''    named = isinstance(state, dict) and b" " not in raw and all(map(NAME_RE.match, state))
+              maps = named and all(isinstance(v, dict) for v in state.values())
+              if maps and all(type(x) is int for v in state.values() for x in v.values()):
+          '''
+          new = '''    # Parsing proves validity, not the literal spelling the byte search requires:
+              # whitespace, escaped names and duplicate keys can all parse differently from a
+              # searched slice. Round-trip equality rules those out; the field-name check also
+              # keeps a '}' inside a key from ending that slice early. Other forms keep the
+              # whole-map answer, without rewriting the file or refusing readable state.
+              named = isinstance(state, dict) and all(map(NAME_RE.fullmatch, state))
+              maps = named and all(
+                  isinstance(v, dict) and v.keys() <= {"floor", "gen", "t"} for v in state.values()
+              )
+              ints = maps and all(type(x) is int for v in state.values() for x in v.values())
+              if ints and raw == orjson.dumps(state):
+          '''
+          assert source.count(old) == 1, 'pinned source no longer matches the reviewed hunk'
+          source = source.replace(old, new)
+          old_doc = '''    records its identity if it is a compact map of NAME_RE names to maps of ints — all that
+              `_set_seq_entry` and `_split_seq_state` produce. In such a file `"<name>":{` occurs only
+          '''
+          new_doc = '''    records its identity only for an exact compact dump of NAME_RE names to flat maps of
+              integer floor/gen/t fields. In such a file `"<name>":{` occurs only
+          '''
+          assert source.count(old_doc) == 1
+          source = source.replace(old_doc, new_doc)
+          source = source.replace(
+              '    whole on every read exactly as before, so it still reads as no state. A rewrite through\n',
+              '    whole on every read with the previous fallback semantics. A rewrite through\n',
+          )
+          path.write_text(source, encoding='utf-8')
+          PY
+          uv run ruff format src/store.py tests/unit/test_seq_entry_admission.py
+          git diff --check
+          uv run pytest tests/unit/test_seq_entry_admission.py tests/unit/test_seq_state.py -q
+
+      - name: Full lint, types, immutable core-size caps, tests and coverage
+        run: uv run just check
+
+      - name: HTTP contract and end-to-end example
+        run: |
+          uv run just contract
+          bash examples/beautiful_chat.sh
+
+      - name: Build and verify the MCP distribution
+        run: |
+          uv build --project mcp --out-dir dist/mcp
+          uv run python tests/verify_mcp_dist.py dist/mcp/*.whl dist/mcp/*.tar.gz
+
+      - name: Install the locked browser test dependencies
+        working-directory: tests
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run the Chromium UI probe against a disposable local service
+        run: |
+          root="$(mktemp -d)"
+          CHAT_ROOT="$root" uv run uvicorn --app-dir src app:app --port 8098 --log-level warning &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; rm -rf "$root"' EXIT
+          for _ in $(seq 30); do
+            curl -fsS localhost:8098/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -fsS localhost:8098/healthz >/dev/null
+          node tests/humans_ui_probe.mjs 8098
+
+      - name: Publish only the tested fix and tests to a new branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = ef457d66bc5519b3930a46bf428fa45a78fd22f4
+          current="$(gh api repos/flop-labs/technocore-chat/pulls/890 --jq '.head.sha')"
+          test "$current" = ef457d66bc5519b3930a46bf428fa45a78fd22f4
+          git diff --exit-code -- . ':!src/store.py'
+          git add src/store.py tests/unit/test_seq_entry_admission.py
+          python - <<'PY'
+          import subprocess
+          paths = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert paths == ['src/store.py', 'tests/unit/test_seq_entry_admission.py'], paths
+          PY
+          git diff --cached --check
+          git config user.name almondous
+          git config user.email 38044896+almondous@users.noreply.github.com
+          git commit -m "fix(store): preserve seq-entry reads across JSON encodings" -m "Follow-up to flop-labs/technocore-chat#890 by sv, based directly on ef457d6. Admit the byte-search fast path only for exact compact dumps with safe integer-field names; preserve whole-map semantics for all other readable forms. Add eight public-reader regressions, red on the PR head and green on its main base and this fix. Developed with ChatGPT and verified in isolated fork CI; no hosted-service or DID activity."
+          git -c credential.helper='!gh auth git-credential' push https://github.com/almondous/technocore-chat.git HEAD:refs/heads/fix/pr890-seq-entry-compat-20260923
+          sha="$(git rev-parse HEAD)"
+          echo "PUBLISHED_FIX_SHA=$sha"
+          git show --stat --oneline HEAD
+          {
+            echo '## Verified PR 890 follow-up'
+            echo "Commit: https://github.com/almondous/technocore-chat/commit/$sha"
+            echo 'Parent: ef457d66bc5519b3930a46bf428fa45a78fd22f4'
+            echo 'Eight regressions: fail on the PR head, pass on its main base and the fix.'
+            echo 'Also passed: just check, HTTP contract, example, MCP distribution, Chromium probe.'
+            echo 'No protected baselines, workflows, DID identifiers or unrelated files in the fix.'
+          } >> "$GITHUB_STEP_SUMMARY"
