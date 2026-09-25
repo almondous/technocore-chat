@@ -1,0 +1,383 @@
+name: Snapshot history verification
+
+# Fork-only verification harness. This file is not part of the published fix.
+on:
+  push:
+    branches: [ci/snapshot-history-read-errors-20260925]
+  workflow_dispatch:
+
+concurrency:
+  group: snapshot-history-verification-20260925
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    if: github.repository == 'almondous/technocore-chat'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        with:
+          enable-cache: true
+
+      - name: Check the unchanged pinned upstream base
+        run: |
+          git switch --detach 0e47f770b13cc27e1e2e199d4cdf70a4778c97cc
+          test "$(git rev-parse HEAD)" = 0e47f770b13cc27e1e2e199d4cdf70a4778c97cc
+          uv sync --frozen
+          uv run python --version
+          uv run pytest tests -q 2>&1 | tee "$RUNNER_TEMP/snapshot-base-suite.log"
+
+      - name: Add regression tests against the real repository modules
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('tests/unit/test_snapshot_read_errors.py')
+          assert not path.exists()
+          path.write_text(r'''"""A failed history read must not authorize replacing the retained snapshots."""
+
+          import errno
+          import os
+          from pathlib import Path
+
+          import orjson
+          import pytest
+
+
+          @pytest.fixture
+          def sampling(monkeypatch):
+              import store
+
+              calls = {"stats": 0}
+
+              def collect(_root):
+                  calls["stats"] += 1
+                  return {"counters": {"messages": 300}}
+
+              monkeypatch.setattr(store, "_bump", lambda _root: None)
+              monkeypatch.setattr(store, "service_stats", collect)
+              return store, calls
+
+
+          def _seed(root, store):
+              """Both samples are retained, but their file is due for another sampling pass."""
+              now = int(store.time.time())
+              history = [
+                  {"t": now - 900, "counters": {"messages": 100}},
+                  {"t": now - 600, "counters": {"messages": 200}},
+              ]
+              path = root / store.SNAPSHOTS_FILE
+              path.write_bytes(b"".join(orjson.dumps(record) + b"\n" for record in history))
+              old = now - store.SNAPSHOT_EVERY - 60
+              os.utime(path, (old, old))
+              return path, history
+
+
+          def _fail_one_read(monkeypatch, target, code):
+              """Only the history read fails; recovery and all other filesystem IO stay real."""
+              original = Path.read_text
+              failures = []
+
+              def read(path, *args, **kwargs):
+                  if path == target and not failures:
+                      failures.append(code)
+                      raise OSError(code, os.strerror(code), str(path))
+                  return original(path, *args, **kwargs)
+
+              monkeypatch.setattr(Path, "read_text", read)
+              return failures
+
+
+          @pytest.mark.parametrize(
+              "code", [errno.EIO, errno.EMFILE, errno.EACCES], ids=["EIO", "EMFILE", "EACCES"]
+          )
+          def test_a_failed_history_read_does_not_replace_history(tmp_path, monkeypatch, sampling, code):
+              store, calls = sampling
+              path, history = _seed(tmp_path, store)
+              before = path.read_bytes()
+              before_mtime = path.stat().st_mtime_ns
+              failures = _fail_one_read(monkeypatch, path, code)
+
+              store._snapshot(tmp_path)
+
+              assert failures == [code], "the intended history read was not reached"
+              assert path.read_bytes() == before, "one failed read erased healthy retained history"
+              assert path.stat().st_mtime_ns == before_mtime, "a failed read reset the throttle"
+              assert calls["stats"] == 0, "unreadable history must stop before collecting a replacement"
+
+              # No clock or mtime change: a skipped sample stays due and can recover immediately.
+              store._snapshot(tmp_path)
+              recovered = store.snapshots(tmp_path)
+              assert recovered[:2] == history
+              assert len(recovered) == 3
+              assert recovered[-1]["counters"]["messages"] == 300
+              assert calls["stats"] == 1
+
+
+          @pytest.mark.parametrize(
+              "code", [errno.EIO, errno.EMFILE, errno.EACCES], ids=["EIO", "EMFILE", "EACCES"]
+          )
+          def test_an_unreadable_history_is_not_an_empty_history(tmp_path, monkeypatch, sampling, code):
+              store, _ = sampling
+              path, history = _seed(tmp_path, store)
+              before = path.read_bytes()
+              failures = _fail_one_read(monkeypatch, path, code)
+              with pytest.raises(OSError) as caught:
+                  store.snapshots(tmp_path)
+              assert caught.value.errno == code
+              assert failures == [code]
+              assert path.read_bytes() == before
+              assert store.snapshots(tmp_path) == history
+
+
+          def test_a_missing_history_still_initializes(tmp_path, sampling):
+              store, calls = sampling
+              assert store.snapshots(tmp_path) == []
+              store._snapshot(tmp_path)
+              result = store.snapshots(tmp_path)
+              assert len(result) == 1 and result[0]["counters"]["messages"] == 300
+              assert calls["stats"] == 1
+
+
+          def test_a_healthy_history_appends_and_throttles(tmp_path, sampling):
+              store, calls = sampling
+              _, history = _seed(tmp_path, store)
+              store._snapshot(tmp_path)
+              result = store.snapshots(tmp_path)
+              assert result[:2] == history and len(result) == 3
+              store._snapshot(tmp_path)
+              assert store.snapshots(tmp_path) == result
+              assert calls["stats"] == 1
+
+
+          def test_a_torn_json_line_still_costs_only_that_line(tmp_path, sampling):
+              store, _ = sampling
+              path, history = _seed(tmp_path, store)
+              before_mtime = path.stat().st_mtime_ns
+              with path.open("ab") as stream:
+                  stream.write(b'{"t":')
+              os.utime(path, ns=(before_mtime, before_mtime))
+              assert store.snapshots(tmp_path) == history
+              store._snapshot(tmp_path)
+              result = store.snapshots(tmp_path)
+              assert result[:2] == history and len(result) == 3
+
+
+          def test_an_aggregate_read_error_keeps_history(tmp_path, monkeypatch, sampling):
+              store, _ = sampling
+              path, history = _seed(tmp_path, store)
+              before = path.read_bytes()
+
+              def collect(_root):
+                  raise OSError(errno.EIO, "test-only aggregate failure")
+
+              monkeypatch.setattr(store, "service_stats", collect)
+              store._snapshot(tmp_path)
+              assert path.read_bytes() == before
+              assert store.snapshots(tmp_path) == history
+
+
+          def test_a_busy_sampler_keeps_history(tmp_path, sampling):
+              store, calls = sampling
+              path, history = _seed(tmp_path, store)
+              before = path.read_bytes()
+              with store._locked(path):
+                  store._snapshot(tmp_path)
+              assert path.read_bytes() == before
+              assert store.snapshots(tmp_path) == history
+              assert calls["stats"] == 0
+
+
+          def test_a_failed_replace_keeps_history(tmp_path, monkeypatch, sampling):
+              store, _ = sampling
+              path, history = _seed(tmp_path, store)
+              before = path.read_bytes()
+
+              def fail_replace(_path, _data):
+                  raise OSError(errno.EIO, "test-only replacement failure")
+
+              monkeypatch.setattr(store, "_replace", fail_replace)
+              store._snapshot(tmp_path)
+              assert path.read_bytes() == before
+              assert store.snapshots(tmp_path) == history
+
+
+          @pytest.mark.parametrize(
+              "code", [errno.EIO, errno.EMFILE, errno.EACCES], ids=["EIO", "EMFILE", "EACCES"]
+          )
+          def test_an_append_survives_failed_sampling_without_erasing_history(tmp_path, monkeypatch, code):
+              """Exercise real append, counter flushing and aggregate collection, not the stubs."""
+              import store
+
+              store.append(tmp_path, "p-snapshot-check", "bot", "before")
+              path, history = _seed(tmp_path, store)
+              before = path.read_bytes()
+              before_mtime = path.stat().st_mtime_ns
+              failures = _fail_one_read(monkeypatch, path, code)
+
+              posted = store.append(tmp_path, "p-snapshot-check", "bot", "after")
+
+              assert failures == [code]
+              assert posted["seq"] == 2 and posted["text"] == "after"
+              assert store.read_messages(tmp_path, "p-snapshot-check")["count"] == 2
+              assert path.read_bytes() == before, "a successful append discarded the old samples"
+              assert path.stat().st_mtime_ns == before_mtime
+              store._snapshot(tmp_path)
+              result = store.snapshots(tmp_path)
+              assert result[:2] == history and len(result) == 3
+              assert result[-1]["counters"]["messages"] == 2
+
+
+          @pytest.mark.parametrize(
+              "code", [errno.EIO, errno.EMFILE, errno.EACCES], ids=["EIO", "EMFILE", "EACCES"]
+          )
+          def test_the_stats_view_does_not_invent_an_empty_history(tmp_path, monkeypatch, code):
+              """The other consumer must not publish a successful-looking history=[] on IO failure."""
+              import app as app_module
+              import store
+
+              path, history = _seed(tmp_path, store)
+              before = path.read_bytes()
+              failures = _fail_one_read(monkeypatch, path, code)
+              with pytest.raises(OSError) as caught:
+                  app_module._stats_view(tmp_path)
+              assert caught.value.errno == code
+              assert failures == [code]
+              assert path.read_bytes() == before
+              assert app_module._stats_view(tmp_path)["history"] == history
+          ''', encoding='utf-8')
+          PY
+          uv run ruff format tests/unit/test_snapshot_read_errors.py
+
+      - name: Require regression failures on the unchanged main implementation
+        run: |
+          set +e
+          uv run pytest tests/unit/test_snapshot_read_errors.py -q --junitxml="$RUNNER_TEMP/snapshot-red.xml" 2>&1 | tee "$RUNNER_TEMP/snapshot-red.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 1
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          suites = list(ET.parse(Path(os.environ['RUNNER_TEMP']) / 'snapshot-red.xml').getroot().iter('testsuite'))
+          counts = {key: sum(int(s.get(key, '0')) for s in suites) for key in ('tests', 'failures', 'errors', 'skipped')}
+          print('RED_COUNTS', counts)
+          assert counts == {'tests': 18, 'failures': 12, 'errors': 0, 'skipped': 0}, counts
+          PY
+
+      - name: Apply the one-line behavior fix and verify recovery
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/store.py')
+          source = path.read_text(encoding='utf-8')
+          old = '''    try:
+                  lines = (root / SNAPSHOTS_FILE).read_text(encoding="utf-8").splitlines()
+              except (OSError, ValueError):
+                  return out
+          '''
+          new = '''    # A failed read is not an empty history: _snapshot rewrites this same file.
+              # Let its best-effort OSError handler skip the sample without replacing old ones.
+              try:
+                  lines = (root / SNAPSHOTS_FILE).read_text(encoding="utf-8").splitlines()
+              except (FileNotFoundError, ValueError):
+                  return out
+          '''
+          assert source.count(old) == 1, 'the reviewed snapshots read hunk changed'
+          path.write_text(source.replace(old, new), encoding='utf-8')
+          PY
+          uv run ruff format src/store.py tests/unit/test_snapshot_read_errors.py
+          git diff --check
+          uv run pytest tests/unit/test_snapshot_read_errors.py -q --junitxml="$RUNNER_TEMP/snapshot-green.xml"
+          uv run python scripts/gen_store_doc.py
+          git diff --exit-code -- docs/store.md
+
+      - name: Full lint, formatting, types, size caps, tests and coverage
+        run: uv run just check 2>&1 | tee "$RUNNER_TEMP/snapshot-full-check.log"
+
+      - name: HTTP contract and end-to-end example
+        run: |
+          uv run just contract
+          bash examples/beautiful_chat.sh
+
+      - name: Build and verify the MCP distribution
+        run: |
+          uv build --project mcp --out-dir dist/mcp
+          uv run python tests/verify_mcp_dist.py dist/mcp/*.whl dist/mcp/*.tar.gz
+
+      - name: Install the locked Chromium test dependencies
+        working-directory: tests
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run the browser probe against a disposable local service
+        run: |
+          root="$(mktemp -d)"
+          CHAT_ROOT="$root" uv run uvicorn --app-dir src app:app --port 8098 --log-level warning &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; rm -rf "$root"' EXIT
+          for _ in $(seq 30); do
+            curl -fsS localhost:8098/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -fsS localhost:8098/healthz >/dev/null
+          node tests/humans_ui_probe.mjs 8098
+
+      - name: Build and smoke the Docker image without publishing it
+        run: |
+          docker build -f docker/Dockerfile -t technocore-chat:snapshot-check .
+          docker run -d --name snapshot-check -e CHAT_ROOT=/tmp/chat -p 8080:8080 technocore-chat:snapshot-check
+          trap 'docker rm -f snapshot-check >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 30); do
+            curl -fsS localhost:8080/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -fsS localhost:8080/healthz
+          curl -fsS 'localhost:8080/r/ci/say/bot/hello%20ci' | grep -q '<~bot> hello ci'
+          curl -fsS localhost:8080/r/ci | grep -q 'hello ci'
+          curl -fsS localhost:8080/openapi.json | grep -q '"openapi"'
+          curl -fsS localhost:8080/.well-known/agent.json | grep -q '"content_is_untrusted"'
+
+      - name: Publish only the verified source fix and regression tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = 0e47f770b13cc27e1e2e199d4cdf70a4778c97cc
+          current="$(gh api repos/flop-labs/technocore-chat/git/ref/heads/main --jq '.object.sha')"
+          test "$current" = 0e47f770b13cc27e1e2e199d4cdf70a4778c97cc
+          git diff --exit-code -- . ':!src/store.py'
+          git add src/store.py tests/unit/test_snapshot_read_errors.py
+          python - <<'PY'
+          import subprocess
+          paths = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert paths == ['src/store.py', 'tests/unit/test_snapshot_read_errors.py'], paths
+          PY
+          git diff --cached --check
+          git config user.name silvercat
+          git config user.email 38044896+almondous@users.noreply.github.com
+          git commit -m "fix(store): preserve snapshot history on read errors" -m "Keep unreadable .snapshots distinct from missing history. A genuine read failure reaches the sampler's existing best-effort handler, preserving the history and its throttle timestamp. Missing/corrupt-input policy stays unchanged. Add deterministic recovery, real append and stats-view regressions. Related to #914's .counters fix, but protects the separate history file. Developed with ChatGPT and verified against pinned upstream main in isolated Linux fork CI; no hosted-service activity."
+          git -c credential.helper='!gh auth git-credential' push https://github.com/almondous/technocore-chat.git HEAD:refs/heads/fix/snapshot-history-read-errors-20260925
+          sha="$(git rev-parse HEAD)"
+          echo "PUBLISHED_FIX_SHA=$sha"
+          git show --stat --oneline HEAD
+          {
+            echo '## Snapshot history verification'
+            echo "Commit: https://github.com/almondous/technocore-chat/commit/$sha"
+            echo 'Base: 0e47f770b13cc27e1e2e199d4cdf70a4778c97cc'
+            echo 'Regression comparison: 12 fail / 6 pass before; 18 pass after.'
+            echo 'Passed: baseline suite, just check, contract, example, MCP distribution, Chromium, Docker build and smoke.'
+            echo 'The source behavior change is one exception tuple; no protocol or protected-file changes.'
+            echo 'Cloudflare Worker bundling is left to upstream CI.'
+            grep -E '[0-9]+ passed|TOTAL ' "$RUNNER_TEMP/snapshot-base-suite.log" "$RUNNER_TEMP/snapshot-full-check.log"
+          } >> "$GITHUB_STEP_SUMMARY"
