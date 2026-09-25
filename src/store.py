@@ -2011,9 +2011,11 @@ def snapshots(root: Path) -> list[dict]:
     """Stored samples, oldest first. Each carries `t` (unix seconds) and the aggregates
     `service_stats` returns. A torn last line costs that one sample, never the history."""
     out = []
+    # A failed read is not an empty history: _snapshot rewrites this same file.
+    # Let its best-effort OSError handler skip the sample without replacing old ones.
     try:
         lines = (root / SNAPSHOTS_FILE).read_text(encoding="utf-8").splitlines()
-    except (OSError, ValueError):
+    except (FileNotFoundError, ValueError):
         return out
     for line in lines:
         try:
