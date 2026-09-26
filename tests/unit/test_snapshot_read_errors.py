@@ -37,6 +37,15 @@ def _seed(root, store):
     return path, history
 
 
+def _seed_invalid_utf8(root, store):
+    """A decode failure after two healthy samples must not erase those samples."""
+    path, history = _seed(root, store)
+    before_mtime = path.stat().st_mtime_ns
+    path.write_bytes(path.read_bytes() + b"\xff\n")
+    os.utime(path, ns=(before_mtime, before_mtime))
+    return path, history
+
+
 def _fail_one_read(monkeypatch, target, code):
     """Only the history read fails; recovery and all other filesystem IO stay real."""
     original = Path.read_text
@@ -209,3 +218,56 @@ def test_the_stats_view_does_not_invent_an_empty_history(tmp_path, monkeypatch, 
     assert failures == [code]
     assert path.read_bytes() == before
     assert app_module._stats_view(tmp_path)["history"] == history
+
+
+def test_invalid_utf8_skips_sampling_without_replacing_history(tmp_path, sampling):
+    store, calls = sampling
+    path, history = _seed_invalid_utf8(tmp_path, store)
+    before = path.read_bytes()
+    before_mtime = path.stat().st_mtime_ns
+
+    store._snapshot(tmp_path)
+
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime_ns == before_mtime
+    assert calls["stats"] == 0
+
+    # Once the unreadable bytes are repaired, the skipped pass is still due.
+    path.write_bytes(b"".join(orjson.dumps(record) + b"\n" for record in history))
+    os.utime(path, ns=(before_mtime, before_mtime))
+    store._snapshot(tmp_path)
+    recovered = store.snapshots(tmp_path)
+    assert recovered[:2] == history and len(recovered) == 3
+    assert calls["stats"] == 1
+
+
+@pytest.mark.parametrize("reader", ["snapshots", "stats"])
+def test_invalid_utf8_is_not_an_empty_history(tmp_path, sampling, reader):
+    import app as app_module
+
+    store, _ = sampling
+    path, _ = _seed_invalid_utf8(tmp_path, store)
+    before = path.read_bytes()
+    read = store.snapshots if reader == "snapshots" else app_module._stats_view
+
+    with pytest.raises(UnicodeDecodeError):
+        read(tmp_path)
+
+    assert path.read_bytes() == before
+
+
+def test_an_append_survives_invalid_utf8_without_erasing_history(tmp_path):
+    """A sampler decode error must not fail a message that has already been stored."""
+    import store
+
+    store.append(tmp_path, "p-snapshot-check", "bot", "before")
+    path, _ = _seed_invalid_utf8(tmp_path, store)
+    before = path.read_bytes()
+    before_mtime = path.stat().st_mtime_ns
+
+    posted = store.append(tmp_path, "p-snapshot-check", "bot", "after")
+
+    assert posted["seq"] == 2 and posted["text"] == "after"
+    assert store.read_messages(tmp_path, "p-snapshot-check")["count"] == 2
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime_ns == before_mtime
