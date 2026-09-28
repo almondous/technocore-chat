@@ -643,6 +643,124 @@ const browser = await chromium.launch({
   await context.close();
 }
 
+// ------------------------------------------------------------- delegation reads in flight
+// Hold real note replies before the page receives them. Switching through the visible
+// sign-out/seed controls must discard the previous identity's rows and late completions.
+{
+  const { createPrivateKey, createHash, sign } = await import("node:crypto");
+  const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  const agent = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+  const identities = [];
+  for (const [byte, scope] of [[17, "r:display-a"], [18, "r:display-b"]]) {
+    const seed = Buffer.alloc(32, byte);
+    const key = createPrivateKey({
+      key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]),
+      format: "der", type: "pkcs8",
+    });
+    const publicBytes = Buffer.from(key.export({ format: "jwk" }).x, "base64url");
+    let n = BigInt("0x" + Buffer.concat([Buffer.from([0xed, 0x01]), publicBytes]).toString("hex"));
+    let encoded = "";
+    while (n) { encoded = alphabet[Number(n % 58n)] + encoded; n /= 58n; }
+    const did = "did:key:z" + encoded;
+    const fp = createHash("sha256").update(did).digest("hex").slice(0, 16);
+    const path = `/kv/did-${fp.slice(0, 2)}/${fp.slice(2)}`;
+    const expires = String(Math.floor(Date.now() / 1000) + 86400);
+    const nonce = String(Date.now());
+    const signature = sign(null, Buffer.from(`delegate|${did}|${agent}|${scope}|${expires}|${nonce}`), key);
+    const value = `delegate: ${agent} ${scope} ${expires} ${nonce} ${signature.toString("base64url")}`;
+    const response = await fetch(`${BASE}${path}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value }),
+    });
+    if (!response.ok) throw new Error(`delegation fixture: HTTP ${response.status}`);
+    identities.push({ seed: seed.toString("hex"), did, path, scope });
+  }
+  const [a, b] = identities;
+  for (const lateError of [false, true]) {
+    const label = `delegation display (${lateError ? "late error" : "late success"})`;
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const errors = [];
+    page.on("pageerror", (e) => errors.push(String(e)));
+    await page.addInitScript(() => {
+      // No room heartbeat may hide the error badge this section is checking.
+      Object.defineProperty(document, "hidden", { get: () => true });
+      const realFetch = window.fetch.bind(window);
+      const realVerify = crypto.subtle.verify.bind(crypto.subtle);
+      window.delegationProbe = { reads: [], verified: 0 };
+      crypto.subtle.verify = async (...args) => {
+        const result = await realVerify(...args);
+        window.delegationProbe.verified++;
+        return result;
+      };
+      window.fetch = async (...args) => {
+        const response = await realFetch(...args);
+        const path = new URL(args[0], location.href).pathname;
+        if (!path.startsWith("/kv/did-") || (args[1]?.method || "GET") !== "GET") return response;
+        const read = { path, returned: false };
+        const held = new Promise((resolve) => {
+          read.release = (error) => resolve(error ? new Response("temporary failure", { status: 503 }) : response);
+        });
+        window.delegationProbe.reads.push(read);
+        const result = await held;
+        read.returned = true;
+        return result;
+      };
+    });
+    await page.goto(`${BASE}/humans`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#identity:not([hidden])", { timeout: 8000 });
+    const signIn = async (identity, count) => {
+      await page.click("#keymore summary");
+      await page.fill("#seed", identity.seed);
+      await page.click("#keyuse");
+      await page.waitForFunction((did) => document.getElementById("me").title === did, identity.did);
+      await page.waitForFunction((n) => window.delegationProbe.reads.length === n, count);
+    };
+    const release = async (index, error = false) => {
+      const before = await page.evaluate(() => window.delegationProbe.verified);
+      await page.evaluate(({ index, error }) => window.delegationProbe.reads[index].release(error), { index, error });
+      await page.waitForFunction((i) => window.delegationProbe.reads[i].returned, index);
+      if (!error) await page.waitForFunction((n) => window.delegationProbe.verified === n + 1, before);
+      // Verification is real WebCrypto. Its promise reactions, including Promise.all
+      // and the final render, drain before this next task; no fixed sleep can race it.
+      await page.evaluate(() => new Promise((resolve) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => {
+          channel.port1.close(); channel.port2.close(); resolve();
+        };
+        channel.port2.postMessage(null);
+      }));
+    };
+    await signIn(a, 1);
+    await release(0);
+    check(`${label}: current identity's verified grant renders`,
+          (await page.locator("#delegations .deleg.ok .scope").textContent()).startsWith(a.scope));
+    await page.click("#keyout");
+    check(`${label}: sign-out clears the previous rows`,
+          (await page.locator("#delegations .deleg").count()) === 0);
+    await signIn(a, 2); // leave A's second read pending across the next sign-out
+    await page.click("#keyout");
+    await signIn(b, 3);
+    check(`${label}: replacement identity starts without the previous rows`,
+          (await page.locator("#delegations .deleg").count()) === 0);
+    await release(2);
+    check(`${label}: replacement identity's verified grant renders`,
+          (await page.locator("#delegations .deleg.ok .scope").textContent()).startsWith(b.scope));
+    const current = await page.locator("#delegations").textContent();
+    const status = await page.locator("#status").textContent();
+    await release(1, lateError);
+    check(`${label}: old completion cannot replace the current grants`,
+          (await page.locator("#delegations").textContent()) === current);
+    check(`${label}: old completion cannot replace the current status`,
+          (await page.locator("#status").textContent()) === status);
+    check(`${label}: the selected identity remains unchanged`,
+          (await page.getAttribute("#me", "title")) === b.did);
+    check(`${label}: no page errors`, errors.length === 0, errors.join("; "));
+    await context.close();
+  }
+}
+
+
 // -------------------------------------------------------------------- passkey + delegation
 // Two things a Python test cannot reach at all: whether an authenticator's PRF output can
 // actually stand in as an Ed25519 seed, and whether the identity comes back on a browser

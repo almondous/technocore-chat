@@ -1552,6 +1552,9 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
             + 'the seed to keep this identity — clearing site data loses it otherwise.')
       : (canPasskey ? SIGNED_OUT_HINT : NO_PASSKEY_HINT);
     agentsEl.hidden = !on;
+    // The next identity's note loads asynchronously; its panel must not keep the last
+    // identity's grants visible in the meantime, including after signing out and back in.
+    delegListEl.textContent = '';
     if (on) loadDelegations();
   }
 
@@ -1733,6 +1736,7 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
   var agentScopeEl = document.getElementById('agent-scope');
   var agentDaysEl = document.getElementById('agent-days');
   var delegListEl = document.getElementById('delegations');
+  var delegationLoad = 0;
 
   function unbase58(str) {
     var n = 0n;
@@ -1881,7 +1885,9 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
 
   function loadDelegations() {
     if (!me) return Promise.resolve();
-    var root = me.did;
+    // Both the identity and this refresh must still be current when verification finishes.
+    // Comparing the object also distinguishes signing back in with the same seed.
+    var owner = me, root = owner.did, version = ++delegationLoad;
     return notePath(root).then(readNote).then(function (note) {
       var found = parseDelegations(note), now = Date.now() / 1000;
       var current = newest(found);
@@ -1899,7 +1905,10 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
           function () { return { d: d, state: 'forged' }; }
         );
       }));
-    }).then(renderDelegations, function (e) {
+    }).then(function (rows) {
+      if (me === owner && version === delegationLoad) renderDelegations(rows);
+    }, function (e) {
+      if (me !== owner || version !== delegationLoad) return;
       renderDelegations([]);
       fail('could not read delegations — ' + String(e.message || e));
     });
