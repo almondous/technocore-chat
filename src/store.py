@@ -893,10 +893,10 @@ def read_messages(
     """Return the newest `limit` messages (oldest-first) with seq > `since`."""
     limit = max(1, min(int(limit), MAX_LIMIT))
     path = room_path(root, room)
-    # Expiry is lazy and drop-on-read: no reaper thread, no per-room timer. Records are
-    # append-ordered, so the first expired record means every older one is expired too and
-    # the scan stops there. `last_seq` deliberately does NOT filter — seq must keep
-    # advancing past records nobody can read any more, or an expired room would reuse seqs.
+    # Expiry is lazy and drop-on-read: no reaper thread, no per-room timer. UTC can move
+    # backwards, so an expired record does not prove that every older record also expired.
+    # `last_seq` deliberately does NOT filter — seq must keep advancing past records nobody
+    # can read any more, or an expired room would reuse seqs.
     cutoff = _cutoff(room)
     out: list[dict] = []
     # The room's head, where a cursor past it is clamped (#565): echoing it back printed a
@@ -913,7 +913,7 @@ def read_messages(
             if since is not None and rec["seq"] <= since:
                 break
             if cutoff is not None and _expired(rec, cutoff):
-                break
+                continue
             out.append(rec)
             if len(out) >= limit:
                 break
