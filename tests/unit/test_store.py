@@ -482,6 +482,19 @@ def test_reap_counts_every_room_it_takes_not_just_the_last(tmp_path):
 
 
 def test_an_ephemeral_room_keeps_the_history_that_has_not_expired(tmp_path, monkeypatch):
+def test_ephemeral_read_keeps_live_record_before_a_clock_rollback(tmp_path, monkeypatch):
+    """A stale record appended after a wall-clock rollback must not hide an older live one."""
+    import store
+    from datetime import UTC, datetime, timedelta
+
+    store.append(tmp_path, "e-clock", "bot", "still live")
+
+    stale = datetime.now(UTC) - timedelta(seconds=store.EPHEMERAL_TTL_SECONDS + 60)
+    monkeypatch.setattr(store, "_now", lambda: stale.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+    store.append(tmp_path, "e-clock", "bot", "written after clock rollback")
+
+    view = store.read_messages(tmp_path, "e-clock", limit=50)
+    assert [message["text"] for message in view["messages"]] == ["still live"]
     """Compaction retains the newest record of an `e-` room unconditionally, then stops at
     the first expired one. The guard that makes it unconditional is `and kept`, and
     dropping it turns every rotation of a *busy* ephemeral room into a truncation to one
