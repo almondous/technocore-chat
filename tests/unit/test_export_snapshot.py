@@ -57,19 +57,6 @@ def test_the_snapshot_stops_at_the_last_complete_line(tmp_path):
 
 
 def test_an_ephemeral_room_exports_only_what_is_still_readable(tmp_path, monkeypatch):
-def test_ephemeral_export_omits_stale_record_after_a_clock_rollback(tmp_path, monkeypatch):
-    """An expired record appended after live data must not leak through export."""
-    from datetime import UTC, datetime, timedelta
-
-    store.append(tmp_path, "e-clock-export", "bot", "still live")
-
-    stale = datetime.now(UTC) - timedelta(seconds=store.EPHEMERAL_TTL_SECONDS + 60)
-    monkeypatch.setattr(store, "_now", lambda: stale.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
-    store.append(tmp_path, "e-clock-export", "bot", "written after clock rollback")
-
-    exported = _export(tmp_path, "e-clock-export")
-    assert b"still live" in exported
-    assert b"written after clock rollback" not in exported
     """Expiry is drop-on-read and export is a read: records the `e-` class promises have
     stopped being readable must not come back out through the raw lane (PR #505 review).
     The unexpired suffix still leaves byte-for-byte."""
@@ -94,6 +81,21 @@ def test_ephemeral_export_omits_stale_record_after_a_clock_rollback(tmp_path, mo
     store.append(tmp_path, "keeps", "bot", "old but durable")
     monkeypatch.undo()
     assert _export(tmp_path, "keeps") == store.room_path(tmp_path, "keeps").read_bytes()
+
+
+def test_ephemeral_export_omits_stale_record_after_a_clock_rollback(tmp_path, monkeypatch):
+    """An expired record appended after live data must not leak through export."""
+    from datetime import UTC, datetime, timedelta
+
+    store.append(tmp_path, "e-clock-export", "bot", "still live")
+
+    stale = datetime.now(UTC) - timedelta(seconds=store.EPHEMERAL_TTL_SECONDS + 60)
+    monkeypatch.setattr(store, "_now", lambda: stale.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+    store.append(tmp_path, "e-clock-export", "bot", "written after clock rollback")
+
+    exported = _export(tmp_path, "e-clock-export")
+    assert b"still live" in exported
+    assert b"written after clock rollback" not in exported
 
 
 def test_a_fully_expired_ephemeral_room_exports_nothing(tmp_path, monkeypatch):
