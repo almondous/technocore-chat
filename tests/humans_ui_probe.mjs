@@ -942,6 +942,140 @@ const browser = await chromium.launch({
 }
 
 
+// ----------------------------------------------------------- identity operations overtaken
+// Complete a real PRF ceremony, but hold delivery of its credential while the reader
+// chooses a seed, creates a key or signs out. Abort cannot recall a credential already returned by the
+// authenticator. Also hold a real Ed25519 import: both lanes must respect the latest choice.
+{
+  const SEED = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+  const EXPECTED = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+  const errors = [];
+  for (const outcome of ["success", "failure", "logout", "import"]) {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    page.on("pageerror", (e) => errors.push(String(e)));
+    // Keep the room heartbeat from replacing the status being measured here.
+    await page.addInitScript(() => {
+      Object.defineProperty(document, "hidden", { get: () => true });
+    });
+    const cdp = await context.newCDPSession(page);
+    await cdp.send("WebAuthn.enable", { enableUI: false });
+    await cdp.send("WebAuthn.addVirtualAuthenticator", {
+      options: {
+        protocol: "ctap2", ctap2Version: "ctap2_1", transport: "internal",
+        hasResidentKey: true, hasUserVerification: true, hasPrf: true,
+        automaticPresenceSimulation: true, isUserVerified: true,
+      },
+    });
+    await page.goto(`${BASE.replace("127.0.0.1", "localhost")}/humans`,
+                    { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#identity:not([hidden])", { timeout: 8000 });
+    if (outcome !== "import") {
+      await page.click("#keymore summary");
+      await page.click("#keypassnew");
+      await page.waitForFunction(() => document.getElementById("me").title.startsWith("did:"),
+                                 null, { timeout: 15000 });
+      await page.click("#keyout");
+    }
+    await page.evaluate((outcome) => {
+      const probe = window.identityProbe = { ready: false };
+      const pending = new Set();
+      const track = (promise) => {
+        pending.add(promise);
+        promise.then(() => pending.delete(promise), () => pending.delete(promise));
+        return promise;
+      };
+      // A task boundary drains promise callbacks. Await native crypto too, since those
+      // operations can finish after that boundary; checking only microtasks misses them.
+      const turn = () => new Promise((resolve) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => {
+          channel.port1.close(); channel.port2.close(); resolve();
+        };
+        channel.port2.postMessage(null);
+      });
+      probe.settle = async () => {
+        let timer;
+        try {
+          await Promise.race([
+            (async () => {
+              await turn();
+              while (pending.size) await Promise.allSettled([...pending]);
+              await turn();
+            })(),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error("identity did not settle")), 8000);
+            }),
+          ]);
+        } finally { clearTimeout(timer); }
+      };
+      const pause = (value) => new Promise((resolve, reject) => {
+        probe.ready = true;
+        probe.release = () => outcome === "failure"
+          ? reject(new DOMException("delayed cancellation", "NotAllowedError")) : resolve(value);
+      });
+      let holdImport = outcome === "import";
+      const importKey = crypto.subtle.importKey.bind(crypto.subtle);
+      crypto.subtle.importKey = (...args) => track(importKey(...args).then((key) => {
+        if (!holdImport) return key;
+        holdImport = false;
+        return pause(key);
+      }));
+      const exportKey = crypto.subtle.exportKey.bind(crypto.subtle);
+      crypto.subtle.exportKey = (...args) => track(exportKey(...args));
+      if (outcome !== "import") {
+        const get = navigator.credentials.get.bind(navigator.credentials);
+        navigator.credentials.get = (...args) => get(...args).then(pause);
+      }
+    }, outcome);
+    if (outcome === "import") {
+      await page.click("#keymore summary");
+      await page.fill("#seed", "11".repeat(32));
+      await page.click("#keyuse");
+    } else {
+      await page.click("#keypass");
+    }
+    await page.waitForFunction(() => window.identityProbe.ready, null, { timeout: 15000 });
+    if (outcome !== "import") await page.click("#keymore summary");
+    if (outcome === "logout") {
+      await page.click("#keynew");
+      await page.waitForFunction(() => document.getElementById("me").title.startsWith("did:"),
+                                 null, { timeout: 8000 });
+      check("identity logout: Create key signs in while the old passkey result is held",
+            /^[0-9a-f]{64}$/.test(await page.evaluate(() => localStorage.getItem("technocore.seed"))));
+    } else {
+      await page.fill("#seed", SEED);
+      await page.click("#keyuse");
+      await page.waitForFunction((did) => document.getElementById("me").title === did,
+                                 EXPECTED, { timeout: 8000 });
+      if (outcome !== "import") {
+        check(`identity ${outcome}: the newer seed signs in while the old result is held`,
+              (await page.getAttribute("#me", "title")) === EXPECTED);
+      }
+    }
+    if (outcome === "logout") await page.click("#keyout");
+    const statusBefore = await page.textContent("#status");
+    const result = await page.evaluate(async () => {
+      window.identityProbe.release();
+      await window.identityProbe.settle();
+      return {
+        did: document.getElementById("me").title,
+        seed: localStorage.getItem("technocore.seed"),
+        status: document.getElementById("status").textContent,
+      };
+    });
+    check(`identity ${outcome}: the old result cannot replace the latest identity`,
+          result.did === (outcome === "logout" ? "" : EXPECTED), result.did);
+    check(`identity ${outcome}: the old result cannot alter the saved seed`,
+          result.seed === (outcome === "logout" ? null : SEED));
+    check(`identity ${outcome}: the old result cannot overwrite the current status`,
+          result.status === statusBefore, result.status);
+    await context.close();
+  }
+  check("identity operations: no page errors throughout", errors.length === 0, errors.join("; "));
+}
+
+
 // ------------------------------------------------------------- a deadline the page owns
 // `publicKey.timeout` is a hint: the spec lets a user agent clamp or ignore it, so it cannot
 // be what bounds a ceremony. This is the engine that ignores it — a get() that never settles
