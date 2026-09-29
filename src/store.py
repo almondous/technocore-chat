@@ -1033,6 +1033,16 @@ def export_room(root: Path, room: str) -> tuple[int, Iterator[bytes]]:
         with f:
             f.seek(start)
             remaining = end - start
+            if cutoff is not None:
+                while remaining > 0:
+                    line = f.readline()
+                    if not line:
+                        return
+                    remaining -= len(line)
+                    rec = _parse(line)
+                    if rec is not None and not _expired(rec, cutoff):
+                        yield line
+                return
             while remaining > 0:
                 block = f.read(min(EXPORT_CHUNK, remaining))
                 if not block:
