@@ -2733,18 +2733,14 @@ def _compact(path: Path, cutoff: float | None = None, keep: int = COMPACT_KEEP_B
     total = 0
     with path.open("rb") as f:
         for line in reverse_lines(f, max_bytes=MAX_ROOM_BYTES):
-            total += len(line) + 1  # the newline this line costs on the way back out
-            if kept and (total > keep or len(kept) >= COMPACT_MAX_LINES):
-                break
             if cutoff is not None and kept:
-                # `and kept`: the newest record is always retained, expired or not, because
-                # `seq` is read back from it. Compacting an `e-` room to nothing would
-                # restart the sequence at 1 and silently strand every cursor pointing past
-                # it. Unreadable on the way out, one line on disk — the cheap side of that
-                # trade. Append-ordered, so everything further back is older still.
                 rec = _parse(line)
                 if rec is None or _expired(rec, cutoff):
-                    break
+                    continue
+            size = len(line) + 1
+            if kept and (total + size > keep or len(kept) >= COMPACT_MAX_LINES):
+                break
+            total += size
             kept.append(line)
     kept.reverse()
     # Not b"\n".join(...): an `e-` room whose every record expired compacts to nothing, and
