@@ -1867,11 +1867,12 @@ def _drop_emptied_namespaces(
 def _recent(marker: Path, interval: int, now: float) -> bool:
     """Share the maintenance throttle's unlocked fast check and locked recheck.
 
-    A missing marker permits the first pass. Other errors remain the caller's decision:
-    snapshots are best effort, while the reaper must not mistake unreadable state for due.
+    Missing or future markers permit a pass: after a wall-clock rollback the job must
+    restamp its marker rather than wait for that old clock to catch up. Other errors remain
+    the caller's decision: snapshots are best effort, while unreadable reaper state is not due.
     """
     try:
-        return now - marker.stat().st_mtime < interval
+        return 0 <= now - marker.stat().st_mtime < interval
     except FileNotFoundError:
         return False
 

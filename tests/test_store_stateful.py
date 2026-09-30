@@ -429,6 +429,25 @@ class StoreLifecycle(RuleBasedStateMachine):
             assert raced
             assert passes.call_count == 1, "a competing worker repeated the store walk"
 
+    @rule(ahead=st.sampled_from([1, 3600, 86400]))
+    def reap_after_clock_rollback(self, ahead: int) -> None:
+        """A future throttle marker permits one pass, then normal throttling resumes."""
+        marker = self.root / ".reaped"
+        marker.touch()
+        future = store.time.time() + ahead
+        os.utime(marker, (future, future))
+        with (
+            patch.object(store, "REAP_EVERY", 600),
+            patch.object(store, "_reap_pass", wraps=store._reap_pass) as passes,
+        ):
+            self._reap_model()
+            store._reap(self.root)
+            assert passes.call_count == 1, "a future marker suppressed maintenance"
+            self._resync()
+            assert marker.stat().st_mtime <= store.time.time()
+            store._reap(self.root)
+            assert passes.call_count == 1, "the recovered marker did not throttle"
+
     # ------------------------------------------------------------------ invariants
 
     @rule(

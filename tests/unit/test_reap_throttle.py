@@ -89,7 +89,7 @@ def test_recent_maintenance_returns_without_taking_a_lock(tmp_path, monkeypatch,
     job(tmp_path)
 
 
-@pytest.mark.parametrize("age", [-1, 299, 300, 301])
+@pytest.mark.parametrize("age", [-3600, -1, 0, 299, 300, 301])
 @pytest.mark.parametrize(
     "job,marker_name,work",
     [
@@ -109,7 +109,7 @@ def test_maintenance_keeps_the_interval_boundary(
     monkeypatch.setattr(store.time, "time", lambda: now)
     with patch.object(store, work, wraps=getattr(store, work)) as ran:
         job(tmp_path)
-        assert ran.call_count == int(age >= 300)
+        assert ran.call_count == int(age < 0 or age >= 300)
 
 
 @pytest.mark.parametrize("failed_read", [1, 2])
