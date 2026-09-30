@@ -887,6 +887,21 @@ def _parse(line: bytes) -> dict | None:
     return rec if isinstance(rec, dict) and isinstance(rec.get("seq"), int) else None
 
 
+def _tail_seq(out: list[dict], since: int | None, head_seq: int) -> int:
+    """The `last_seq` a read reports, which is the cursor a client polls with next.
+
+    With no readable record, a caller-supplied `since` is clamped to the room's head (#565).
+    A fresh read (`since is None`) reports the head itself: when every `e-` record has
+    expired the room still has a high-water mark, and reporting 0 would restart the next
+    cursor at the beginning despite it (#287).
+    """
+    if out:
+        return out[-1]["seq"]
+    if since is None:
+        return head_seq
+    return min(since, head_seq)
+
+
 def read_messages(
     root: Path, room: str, limit: int = DEFAULT_LIMIT, since: int | None = None
 ) -> dict:
@@ -924,7 +939,7 @@ def read_messages(
         "room": room,
         "count": len(out),
         "first_seq": out[0]["seq"] if out else None,
-        "last_seq": out[-1]["seq"] if out else min(since or 0, head_seq),
+        "last_seq": _tail_seq(out, since, head_seq),
         "generation": room_generation(root, room),
         "messages": out,
     }
@@ -1023,7 +1038,8 @@ def export_room(root: Path, room: str) -> tuple[int, Iterator[bytes]]:
         return room_generation(root, room), iter(())
     try:
         end = _snapshot_bytes(f)
-        start = _export_start(f, _cutoff(room), end)
+        cutoff = _cutoff(room)
+        start = _export_start(f, cutoff, end)
         generation = room_generation(root, room)
     except BaseException:
         f.close()
@@ -2733,6 +2749,11 @@ def _compact(path: Path, cutoff: float | None = None, keep: int = COMPACT_KEEP_B
     total = 0
     with path.open("rb") as f:
         for line in reverse_lines(f, max_bytes=MAX_ROOM_BYTES):
+            # `and kept`: the newest record is always retained, expired or not, because
+            # `seq` is read back from it. Compacting an `e-` room to nothing would
+            # restart the sequence at 1 and silently strand every cursor pointing past
+            # it. Older expired records are skipped, not a stop: UTC can move
+            # backwards, so a live record behind an expired one must survive rotation.
             if cutoff is not None and kept:
                 rec = _parse(line)
                 if rec is None or _expired(rec, cutoff):
