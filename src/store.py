@@ -1867,21 +1867,21 @@ def _reap(root: Path) -> None:
     refused it a moment later anyway. Nothing else ever takes this lock, so it orders against
     nothing and cannot deadlock.
 
-    The throttle itself stays outside that lock, and the touch with it, exactly where they
-    were: the lock is a mutex on the pass, not on the marker, and arming the throttle before
-    the walk starts is what keeps a 30 s pass from being re-run by the very next writer.
+    Check and arm the throttle under the same lock. A worker can observe an old marker,
+    pause until another pass finishes, then acquire a free lock: exclusion alone would
+    let it repeat the entire walk. A caller that loses the lock must not move the marker
+    either, since it has done no work to postpone the next eligible pass.
     """
     marker = root / ".reaped"
-    now = time.time()
-    try:
-        if now - marker.stat().st_mtime < REAP_EVERY:
-            return
-    except FileNotFoundError:
-        pass
-    root.mkdir(parents=True, exist_ok=True)
-    marker.touch()
     try:
         with _locked(marker, nb=True):
+            now = time.time()
+            try:
+                if now - marker.stat().st_mtime < REAP_EVERY:
+                    return
+            except FileNotFoundError:
+                pass
+            marker.touch()
             _reap_pass(root, now)
     except BlockingIOError:
         return  # a pass is already running in another worker; nothing here waits for it
@@ -1895,8 +1895,7 @@ def _reap_forever(root: Path, stop: threading.Event) -> None:
     ordinary write crossed the interval first carried the whole walk: minutes on the live
     store, past the edge's 100 s origin timeout, holding a request thread and contending with
     request writes for `.counters.lock` (#588) the whole time. The marker's throttle and lock
-    are unchanged, so it is still one pass per REAP_EVERY across the service however many
-    workers wait here.
+    keep this at one pass per REAP_EVERY across the service however many workers wait here.
 
     It waits before its first pass: a worker that has just started has no reason to walk the
     store ahead of the throttle, and a test that starts the app gets no pass racing it. A
