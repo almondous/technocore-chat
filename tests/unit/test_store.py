@@ -337,10 +337,8 @@ def test_orphan_locks_are_swept(tmp_path):
     for p in (path, lock):
         _age(p, store.IDLE_SECONDS + 60)
     _arm_reaper(tmp_path)
-    store.append(tmp_path, "other", "bot", "hi")  # reaps the data file, keeps its lock
+    store.append(tmp_path, "other", "bot", "hi")  # reaps data and sweeps its unheld lock
     assert not path.exists()
-    _arm_reaper(tmp_path)
-    store.append(tmp_path, "other", "bot", "again")  # next pass sweeps the orphan lock
     assert not lock.exists()
 
 
@@ -358,10 +356,8 @@ def test_the_note_side_of_the_sweep_is_wired_up_too(tmp_path):
 
     for target in (note, lock):
         _age(target, store.IDLE_SECONDS + 60)
-    _reap_now(tmp_path)  # takes the data file, keeps the lock a writer might hold
+    _reap_now(tmp_path)  # unheld sidecars are reclaimed in the same pass as their data
     assert not note.exists()
-
-    _reap_now(tmp_path)
     assert not lock.exists(), "an orphaned note lock is swept like a room's"
     # …and the namespace directory goes with the last note in it, or every namespace ever
     # written stays on disk as an empty directory.
@@ -370,7 +366,7 @@ def test_the_note_side_of_the_sweep_is_wired_up_too(tmp_path):
 
 def test_a_lock_is_never_swept_while_its_data_file_is_there(tmp_path):
     """The sweep spares a lock whose data file still exists, whatever the lock's own age —
-    a lock is touched only when someone writes, so a busy room with a quiet week looks
+    a lock is never refreshed by flock, so a busy room with an old sidecar looks
     exactly like an orphan. Unlinking it splits the lock domain: the next writer locks a
     fresh inode and two writers append at once."""
     import store

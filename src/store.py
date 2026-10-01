@@ -533,8 +533,7 @@ def _migrate(legacy: Path, sharded: Path) -> None:
     ever called on a path `_resolve` handed out, and `_resolve` hands out the legacy path only
     while the file is still there — so the lock a live writer holds is always the one beside
     the file it is writing. `_sweep_orphan_locks` already exists for precisely this shape (a
-    lock whose data file is gone) and reclaims it once it has been idle as long as any reaped
-    room.
+    lock whose data file is gone) and reclaims it on the next pass that finds it unheld.
 
     The reaper is the one caller that can hold a legacy lock, because it locks what its walk
     found rather than what a resolver returned. It only ever unlinks, and it re-stats by path
@@ -653,15 +652,23 @@ def _locked(target: Path, shared: bool = False, nb: bool = False):
     exclusively and waits them out. A read/write open is deliberate and safe: flock locks the
     open file description, not a byte range, so LOCK_SH on a writable fd is ordinary.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
     lock = target.with_suffix(target.suffix + ".lock")
-    with open(lock, "a+b") as lf:
-        fcntl.flock(lf, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB * nb)
-        config._dbg(2, "flock", path=target.name)
-        try:
-            yield
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    while True:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock, "a+b") as lf:
+            fcntl.flock(lf, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB * nb)
+            # A sweeper may have removed this inode between open and flock. A waiter
+            # must retry against the name before touching the data it thinks it guards.
+            current = False
+            with suppress(FileNotFoundError):
+                current = os.path.samefile(lf.fileno(), lock)
+            if current:
+                config._dbg(2, "flock", path=target.name)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+                return
 
 
 def _replace(path: Path, data: bytes, fsync: bool = False) -> None:
@@ -1719,28 +1726,22 @@ def _split_seq_state(root: Path) -> None:
         pass
 
 
-def _sweep_orphan_locks(root: Path, now: float, touched: dict[str, set[str]]) -> None:
-    """Unlink sidecar locks whose data file is gone and that have been idle as long as any
-    reaped room. `now` is the caller's, so every reapability decision in one pass is made
-    against one instant rather than a clock that moves through it.
+def _sweep_orphan_locks(root: Path, touched: dict[str, set[str]]) -> None:
+    """Unlink sidecars whose data is gone and whose lock nobody holds, at any age.
 
-    Records what it emptied into `touched`, beside what the reap loop deleted, because a
-    swept lock is usually the last thing standing between a namespace or a bucket and being
-    empty — the deletion that drained it happened a pass or more ago, so without this the
-    directory would be empty and never looked at again.
+    A lock's mtime is its creation time: flock does not refresh it. An idle-reaped
+    file's lock is already old enough to sweep in the same pass, so age never bought
+    a recreating writer the grace it promised. Taking the writer's own nonblocking
+    lock checks the property directly. `_locked` also retries detached inodes, so a
+    writer that opened a sidecar before this unlink cannot later enter on that orphan.
 
-    Sidecar locks are deliberately *not* removed with their data file: unlinking one a writer
-    holds splits the lock domain, and the next writer locks a fresh inode. Sweeping the
-    orphans instead keeps directory entries bounded while never touching the lock of a room
-    anyone still writes to. Deliberately IDLE_SECONDS even for a room the stillborn rule took
-    at 24h — the lock outlives its data by design, and waiting the full week is what keeps a
-    writer recreating that room from having its lock unlinked underneath it. The drift is
-    bounded by the room cap: at most a week of churn in empty files.
+    Record successfully emptied directories in `touched` so the existing span-guarded
+    cleanup can reclaim buckets and namespaces without racing a create's mkdir/open.
     """
     for sub, suffix in (("rooms", ".jsonl.lock"), ("notes", ".txt.lock")):
         base = f"{root / sub}{os.sep}"
         for entry in _walk(root / sub, suffix):
-            try:
+            with suppress(OSError):
                 # Slicing `.lock` off the name is `Path.with_suffix("")` without the Path,
                 # and os.access is `.exists()` without the stat_result it throws away: 26.0
                 # µs per lock as it was, 3.6 µs now, over 12,079 room locks. os.access asks
@@ -1752,12 +1753,14 @@ def _sweep_orphan_locks(root: Path, now: float, touched: dict[str, set[str]]) ->
                 # directory fd out of the walk would buy a rounding error and cost an fd
                 # lifetime per namespace. The Path was the expense, not the syscall.
                 data = entry.path[: -len(".lock")]
-                if os.access(data, os.F_OK) or now - entry.stat().st_mtime <= IDLE_SECONDS:
+                if os.access(data, os.F_OK):
                     continue
-                os.unlink(entry.path)
-                touched[sub].add(_emptied(base, entry.path, sub == "notes"))
-            except OSError:
-                continue
+                # Use the same inode-validated lock as writers. Held means in flight;
+                # age alone cannot distinguish a recreation from an orphan.
+                with _locked(Path(data), nb=True):
+                    if not os.access(data, os.F_OK):
+                        os.unlink(entry.path)
+                        touched[sub].add(_emptied(base, entry.path, sub == "notes"))
 
 
 def _drop_emptied_namespaces(
@@ -1848,18 +1851,16 @@ def _drop_emptied_namespaces(
                 settled = fresh or not (before or after or os.access(file, os.F_OK))
                 if settled and ns.path not in dirs:
                     continue
-                try:
-                    with _locked((root / NOTES_FILE).with_suffix(".create")):
-                        Path(file).unlink(missing_ok=True)
-                        if ns.path in dirs:
-                            # Buckets first: since sharding a namespace's notes sit a level
-                            # further down, so a drained namespace holds empty directories,
-                            # and rmdir refuses those exactly as it refuses notes. Without
-                            # this the namespace below never goes.
-                            _prune(ns.path)
-                            os.rmdir(ns.path)  # rmdir refuses a directory with entries
-                except OSError:
-                    continue  # a tree we may not write, or a create that got there first
+                # A tree we may not write, or a create that got there first, stays.
+                with suppress(OSError), _locked((root / NOTES_FILE).with_suffix(".create")):
+                    Path(file).unlink(missing_ok=True)
+                    if ns.path in dirs:
+                        # Buckets first: since sharding a namespace's notes sit a level
+                        # further down, so a drained namespace holds empty directories,
+                        # and rmdir refuses those exactly as it refuses notes. Without
+                        # this the namespace below never goes.
+                        _prune(ns.path)
+                        os.rmdir(ns.path)  # rmdir refuses a directory with entries
     except OSError:
         pass  # no notes yet, or nothing readable: no count to heal and no namespace to drop
 
@@ -1984,7 +1985,7 @@ def _reap_pass(root: Path, now: float) -> None:
                 continue  # racing writer or vanished file: next pass picks it up
     if any(reaped.values()):  # one lock for the whole pass, not one per deleted room
         _bump(root, **reaped)
-    _sweep_orphan_locks(root, now, touched)
+    _sweep_orphan_locks(root, touched)
     # Both counts after the deletions and after the orphan-lock sweep, so each figure
     # describes the disk as it now is. Each is one exclusive acquisition of its own span held
     # for a read and a replace; nothing that scales with the store happens inside either, which
@@ -2000,11 +2001,9 @@ def _reap_pass(root: Path, now: float) -> None:
     # every create in the store queues on; a bucket only ever needs removing if this pass
     # emptied it. After the sweep, so a bucket whose last orphan lock has just gone is reached.
     for d in touched["rooms"] - {str(root / "rooms")}:  # a flat legacy room's dirname IS that
-        try:
-            with _locked((root / USAGE_FILE).with_suffix(".create")):
-                os.rmdir(d)  # empty buckets only: rmdir refuses a directory with entries
-        except OSError:
-            continue  # best effort, like the rest of the tail: the next pass tries again
+        # Best effort: a refilled bucket stays for the next pass.
+        with suppress(OSError), _locked((root / USAGE_FILE).with_suffix(".create")):
+            os.rmdir(d)  # empty buckets only: rmdir refuses a directory with entries
 
 
 def snapshots(root: Path) -> list[dict]:
