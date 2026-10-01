@@ -11,10 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: a39a2104f812ea57137b147a31f15ddd7d1d82ba
+          ref: 885c6ad08012dbec240292ecabfc0fedae39270e
           persist-credentials: false
       - name: Verify immutable code revision
-        run: test "$(git rev-parse HEAD)" = a39a2104f812ea57137b147a31f15ddd7d1d82ba
+        run: test "$(git rev-parse HEAD)" = 885c6ad08012dbec240292ecabfc0fedae39270e
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
         with:
           enable-cache: true
