@@ -1,0 +1,40 @@
+name: PR 708 lifecycle validation
+on:
+  push:
+    branches: [ci/pr708-lifecycle-20261001]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ba19f64baa5df3ba4f4018c603a3a048ed42b21c
+          persist-credentials: false
+      - name: Verify immutable code revision
+        run: test "$(git rev-parse HEAD)" = ba19f64baa5df3ba4f4018c603a3a048ed42b21c
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Canonical lint, types, size, tests and coverage
+        run: uv run just check
+      - name: Over-the-wire API contract
+        run: uv run just contract
+      - name: Install official browser-test dependencies
+        working-directory: tests
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Start service with shipped limits
+        run: |
+          CHAT_ROOT="$(mktemp -d)" uv run uvicorn --app-dir src app:app --port 8099 --log-level warning &
+          for _ in $(seq 30); do
+            curl -fsS localhost:8099/healthz && break
+            sleep 1
+          done
+          curl -fsS localhost:8099/healthz
+      - name: Unchanged official Chromium probe
+        run: node tests/humans_ui_probe.mjs 8099
