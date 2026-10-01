@@ -33,8 +33,20 @@ def test_room_stat_error_keeps_guard_and_continues_reaping(tmp_path, monkeypatch
     _age(unrelated)
 
     real_room_path, real_stat = store.room_path, Path.stat
+    real_walk = store._walk
+    note_order = []
     armed = False
     failures = 0
+
+    def guard_first(d, suffix):
+        entries = real_walk(d, suffix)
+        if Path(d) == tmp_path / "notes" and suffix == ".txt":
+            # Cleanup before the failed guard would not prove the pass continues.
+            for entry in sorted(entries, key=lambda entry: entry.path != str(guard)):
+                note_order.append(entry.path)
+                yield entry
+        else:
+            yield from entries
 
     def resolve_then_fail(root, name):
         nonlocal armed
@@ -54,6 +66,7 @@ def test_room_stat_error_keeps_guard_and_continues_reaping(tmp_path, monkeypatch
         return real_stat(path, *args, **kwargs)
 
     with monkeypatch.context() as patch:
+        patch.setattr(store, "_walk", guard_first)
         patch.setattr(store, "room_path", resolve_then_fail)
         patch.setattr(Path, "stat", stat)
         _reap(tmp_path)
@@ -62,6 +75,7 @@ def test_room_stat_error_keeps_guard_and_continues_reaping(tmp_path, monkeypatch
     assert store.note_get(tmp_path, ns, "d-live") == "guard-value"
     assert room.exists()
     assert not unrelated.exists()  # one unknown room must not abort other cleanup
+    assert note_order == [str(guard), str(unrelated)]
     assert store.note_stats(tmp_path)["total"] == 1
     assert store.note_stats(tmp_path)["bytes"] == len(b"guard-value")
 
