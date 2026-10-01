@@ -152,6 +152,25 @@ def test_a_map_written_after_the_split_wins_over_the_shard(tmp_path) -> None:
     assert kept == {"gone": {"floor": 5, "gen": 1}}, "the backup lost the original state"
 
 
+def test_mixed_upgrade_keeps_newer_generation_floor_coupled(tmp_path) -> None:
+    """A newer recreate owns the floor, even when an older worker recorded a larger floor.
+
+    Generation and floor describe one room lifecycle. Merging either independently can make
+    cursors treat a new conversation as if it still had the old conversation's floor.
+    """
+    import store
+
+    _legacy(tmp_path, {"gone": {"floor": 500, "gen": 2}})
+    _reap_now(tmp_path)
+    # A still-running old worker recreates the legacy map with a newer generation.
+    # Its cleared floor belongs to that lifecycle; the older shard's floor must not leak in.
+    _legacy(tmp_path, {"gone": {"floor": 0, "gen": 9}})
+    _reap_now(tmp_path)
+
+    assert store.last_seq(tmp_path, "gone") == 0
+    assert store.room_generation(tmp_path, "gone") == 9
+
+
 # --------------------------------------------------------------------------- reads
 
 
@@ -418,3 +437,138 @@ def test_seq_state_survives_a_read_only_store(tmp_path) -> None:
     store._set_seq_entry(tmp_path, "nope", 5)  # must not raise
     assert store.last_seq(tmp_path, "nope") == 0
     assert os.path.isdir(shard)
+
+
+@pytest.mark.parametrize("recovered", [False, True], ids=["first", "recovered"])
+@pytest.mark.parametrize("bad", [None, [], 7, "torn"])
+@pytest.mark.parametrize("bad_legacy", [False, True], ids=["bad-shard", "bad-legacy"])
+def test_split_preserves_the_only_valid_lifecycle(tmp_path, recovered, bad, bad_legacy):
+    import store
+
+    good = {"floor": 50, "gen": 3}
+    backup = tmp_path / ".seqstate.pre-shard"
+    if recovered:
+        backup.write_bytes(orjson.dumps({"original": {"floor": 1, "gen": 1}}))
+    before = backup.read_bytes() if recovered else None
+    legacy, shard = (bad, good) if bad_legacy else (good, bad)
+    _legacy(tmp_path, {"gone": legacy})
+    store._seq_state_path(tmp_path, "gone").write_bytes(orjson.dumps({"gone": shard}))
+
+    store._split_seq_state(tmp_path)
+    assert store.last_seq(tmp_path, "gone") == 50
+    assert store.room_generation(tmp_path, "gone") == 3
+    assert not (tmp_path / ".seqstate").exists()
+    assert backup.read_bytes() == (before if recovered else orjson.dumps({"gone": legacy}))
+    store._split_seq_state(tmp_path)
+    assert store.last_seq(tmp_path, "gone") == 50
+    store._write_record(tmp_path, "gone", "bot", "back")
+    result = store.read_messages(tmp_path, "gone", since=50)
+    assert [message["seq"] for message in result["messages"]] == [51]
+    assert store.room_generation(tmp_path, "gone") == 4
+
+
+@pytest.mark.parametrize("recovered", [False, True], ids=["first", "recovered"])
+@pytest.mark.parametrize(
+    "legacy,shard,expected",
+    [
+        ({"floor": 50, "gen": 3}, {"floor": 10, "gen": 3}, {"floor": 50, "gen": 3}),
+        ({"floor": 10, "gen": 3}, {"floor": 50, "gen": 3}, {"floor": 50, "gen": 3}),
+        ({"floor": 0, "gen": 9}, {"floor": 500, "gen": 2}, {"floor": 0, "gen": 9}),
+        ({"floor": 500, "gen": 2}, {"floor": 0, "gen": 9}, {"floor": 0, "gen": 9}),
+        ({"floor": -1, "gen": "bad"}, {"floor": 50, "gen": 0}, {"floor": 50, "gen": 0}),
+        ({"floor": 50, "gen": 0}, {"floor": [], "gen": -1}, {"floor": 50, "gen": 0}),
+    ],
+)
+def test_split_merges_lifecycle_in_both_directions(tmp_path, recovered, legacy, shard, expected):
+    import store
+
+    backup = tmp_path / ".seqstate.pre-shard"
+    if recovered:
+        backup.write_bytes(orjson.dumps({"original": {"floor": 1, "gen": 1}}))
+    before = backup.read_bytes() if recovered else None
+    _legacy(tmp_path, {"gone": legacy})
+    store._seq_state_path(tmp_path, "gone").write_bytes(orjson.dumps({"gone": shard}))
+    store._split_seq_state(tmp_path)
+    assert store.last_seq(tmp_path, "gone") == expected["floor"]
+    assert store.room_generation(tmp_path, "gone") == expected["gen"]
+    assert backup.read_bytes() == (before if recovered else orjson.dumps({"gone": legacy}))
+    store._split_seq_state(tmp_path)
+    assert store.last_seq(tmp_path, "gone") == expected["floor"]
+    store._write_record(tmp_path, "gone", "bot", "back")
+    result = store.read_messages(tmp_path, "gone", since=expected["floor"])
+    assert [message["seq"] for message in result["messages"]] == [expected["floor"] + 1]
+    assert store.room_generation(tmp_path, "gone") == expected["gen"] + 1
+
+
+def test_lifecycle_order_preserves_numeric_merge_semantics():
+    """Whole snapshots implement the same lifecycle ordering, including malformed fields."""
+    from itertools import product
+
+    import store
+
+    missing = object()
+    values = [missing, None, [], "bad", -1, 0, False, True, 1, 2, 3.5, 50]
+    entries = [None, [], 7, "bad"] + [
+        {key: value for key, value in (("gen", gen), ("floor", floor)) if value is not missing}
+        for gen, floor in product(values, repeat=2)
+    ]
+
+    def field(entry, key):
+        value = entry.get(key) if isinstance(entry, dict) else None
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    for current, incoming in product(entries, repeat=2):
+        chosen = max((incoming, current), key=store._seq_order)
+        if not isinstance(current, dict):
+            expected = incoming
+        elif not isinstance(incoming, dict):
+            expected = current
+        elif field(current, "gen") > field(incoming, "gen"):
+            expected = current
+        elif field(incoming, "gen") > field(current, "gen"):
+            expected = incoming
+        else:
+            expected = {
+                "gen": field(current, "gen"),
+                "floor": max(field(current, "floor"), field(incoming, "floor")),
+            }
+        assert (field(chosen, "gen"), field(chosen, "floor")) == (
+            field(expected, "gen"),
+            field(expected, "floor"),
+        ), (current, incoming)
+
+
+@pytest.mark.parametrize(
+    "current,incoming,winner",
+    [
+        (
+            {"gen": 2, "floor": 50, "t": 10, "current_only": 1},
+            {"gen": 2, "floor": 10, "t": 20, "incoming_only": 2},
+            "current",
+        ),
+        (
+            {"gen": 2, "floor": 50, "t": 10, "current_only": 1},
+            {"gen": 3, "floor": 0, "t": 20, "incoming_only": 2},
+            "incoming",
+        ),
+        (
+            {"gen": 2, "floor": 50, "t": 10, "current_only": 1},
+            {"gen": 2, "floor": 50, "t": 20, "incoming_only": 2},
+            "incoming",
+        ),
+        ({}, None, "current"),
+        (None, {}, "incoming"),
+        ([], "bad", "incoming"),
+    ],
+)
+def test_split_keeps_metadata_with_winning_snapshot(tmp_path, current, incoming, winner):
+    """Do not combine a winning floor with timestamps/unknown fields from a losing state."""
+    import store
+
+    _legacy(tmp_path, {"gone": incoming})
+    path = store._seq_state_path(tmp_path, "gone")
+    path.write_bytes(orjson.dumps({"gone": current, "untouched": {"gen": 1, "floor": 7}}))
+    store._split_seq_state(tmp_path)
+    actual = orjson.loads(path.read_bytes())
+    assert actual["gone"] == (current if winner == "current" else incoming)
+    assert actual["untouched"] == {"gen": 1, "floor": 7}

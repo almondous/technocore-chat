@@ -721,6 +721,12 @@ def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _nonnegative(entry: object, key: str) -> int:
+    """Read a nonnegative integer field, treating malformed maps and values as zero."""
+    value = entry.get(key) if isinstance(entry, dict) else None
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
 def counters(root: Path, strict: bool = True) -> dict:
     """The lifetime counters, with every key present. Read without the lock: the file is
     replaced atomically, so a reader either sees the old bytes or the new ones.
@@ -737,13 +743,7 @@ def counters(root: Path, strict: bool = True) -> dict:
         data = orjson.loads((root / COUNTERS_FILE).read_bytes())
     except zeros:
         data = {}
-    if not isinstance(data, dict):
-        data = {}
-    out = {}
-    for key in COUNTER_KEYS:
-        value = data.get(key, 0)
-        out[key] = value if isinstance(value, int) and value >= 0 else 0
-    return out
+    return {key: _nonnegative(data, key) for key in COUNTER_KEYS}
 
 
 # Deltas wait here between flushes, one bucket per store root. Fixed size whatever the write
@@ -1132,6 +1132,16 @@ def _seq_entry(path: Path, room: str) -> object:
     return state.get(room)
 
 
+def _seq_order(entry: object) -> tuple[bool, int, int]:
+    """Valid state first, then lifecycle, then high-water mark within that lifecycle.
+
+    Selecting a whole entry keeps its floor and generation coupled. Metadata stays with
+    the selected state too; `t` is advisory and currently has no readers. Equal states
+    retain the incoming legacy entry (the first argument to `max` in the split).
+    """
+    return isinstance(entry, dict), _nonnegative(entry, "gen"), _nonnegative(entry, "floor")
+
+
 def _seq_field(root: Path, room: str, key: str) -> int:
     """`room`'s `floor` or `gen`, always as a non-negative int.
 
@@ -1147,8 +1157,7 @@ def _seq_field(root: Path, room: str, key: str) -> int:
     entry = _seq_entry(_seq_state_path(root, room), room)
     if not isinstance(entry, dict):
         entry = _read_seq_state(_seq_state_path(root)).get(room)
-    value = entry.get(key) if isinstance(entry, dict) else None
-    return value if isinstance(value, int) and value >= 0 else 0
+    return _nonnegative(entry, key)
 
 
 def _set_seq_entry(root: Path, room: str, floor: int | None) -> None:
@@ -1675,18 +1684,11 @@ def _split_seq_state(root: Path) -> None:
     Grouped before any shard is opened, so this costs one pass over the map and one lock per
     *shard* rather than one per room.
 
-    Which side of the merge wins is decided by whether the backup already exists, and the two
-    cases are opposite for the same reason — the later write is the true one:
-
-      - **The first split.** No backup yet, so every entry in the map predates this pass, and
-        anything already in a shard was put there by `_set_seq_entry` while this ran. The shard
-        wins.
-      - **A map that came back.** The backup exists, so this map was written *after* a split
-        had already consumed and renamed the original — which only an old worker still running
-        the pre-shard code does, during a rolling upgrade. Its entry is then the newer fact and
-        the shard's is stale, so the map wins. Getting this backwards silently drops that
-        worker's reap or create: the room's floor regresses and cursors past it miss messages,
-        or a generation bump is lost and a stateful reader is told nothing changed.
+    A structurally valid entry wins over a malformed one. Among valid entries, the newer
+    generation wins as a whole: a recreate clears the floor, so a floor from an older
+    lifecycle must not leak into it. Within one generation, floors merge by high-water mark.
+    A rolling upgrade can update either the legacy map or the shard; backup presence does
+    not establish which lifecycle state is newer.
 
     The recovered map is unlinked rather than renamed, so the backup keeps holding the *whole*
     pre-shard state. Overwriting it with the handful of entries a mixed-version window produced
@@ -1712,8 +1714,9 @@ def _split_seq_state(root: Path) -> None:
             for path, entries in shards.items():
                 with _locked(path):
                     shard = _read_seq_state(path)
-                    merged = {**entries, **shard} if first else {**shard, **entries}
-                    _replace(path, orjson.dumps(merged), fsync=config.FSYNC)
+                    for room, entry in entries.items():
+                        shard[room] = max((entry, shard.get(room)), key=_seq_order)
+                    _replace(path, orjson.dumps(shard), fsync=config.FSYNC)
             legacy.replace(backup) if first else legacy.unlink()
     except OSError:
         pass
