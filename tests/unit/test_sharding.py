@@ -166,6 +166,7 @@ def test_the_migration_never_replaces_a_sidecar_lock(tmp_path):
     legacy = _legacy_room(tmp_path, "old", _record(1, "one"))
     legacy_lock = legacy.with_suffix(".jsonl.lock")
 
+    (tmp_path / ".reaped").touch()  # inspect migration before the orphan sweep runs
     store.append(tmp_path, "old", "alice", "two")
     fresh = store.room_path(tmp_path, "old").with_suffix(".jsonl.lock")
 
@@ -181,15 +182,14 @@ def test_the_sweeper_reclaims_the_lock_the_migration_left(tmp_path, monkeypatch)
 
     legacy = _legacy_room(tmp_path, "old", _record(1, "one"))
     legacy_lock = legacy.with_suffix(".jsonl.lock")
+    (tmp_path / ".reaped").touch()  # inspect migration before the orphan sweep runs
     store.append(tmp_path, "old", "alice", "two")
     assert legacy_lock.exists(), "premise: the migration left it"
 
-    old = time.time() - store.IDLE_SECONDS - 60
-    os.utime(legacy_lock, (old, old))
     monkeypatch.setattr(store, "REAP_EVERY", 0)
     store._reap(tmp_path)
 
-    assert not legacy_lock.exists(), "an idle lock with no data file must be swept"
+    assert not legacy_lock.exists(), "an unheld lock with no data is swept without an age grace"
     assert store.read_messages(tmp_path, "old", limit=5)["messages"][-1]["text"] == "two"
 
 

@@ -138,6 +138,20 @@ class StoreLifecycle(RuleBasedStateMachine):
             setattr(store, name, value)
         shutil.rmtree(self.root, ignore_errors=True)
 
+    @rule(room=st.sampled_from(ROOMS), note=st.booleans(), shared=st.booleans())
+    def sweep_lock_lifecycle(self, room: str, note: bool, shared: bool) -> None:
+        """A sweep cannot detach a holder; after release, only data keeps a lock alive."""
+        path = (
+            store.note_path(self.root, "plans", room) if note else store.room_path(self.root, room)
+        )
+        lock = path.with_suffix(path.suffix + ".lock")
+        with store._locked(path, shared=shared):
+            before = lock.stat()
+            store._sweep_orphan_locks(self.root, {"rooms": set(), "notes": set()})
+            assert os.path.samestat(before, lock.stat())
+        store._sweep_orphan_locks(self.root, {"rooms": set(), "notes": set()})
+        assert lock.exists() == path.exists()
+
     # ------------------------------------------------------------------ the reaper, modelled
     #
     # "gone", "kept", or None — None when an age sits close enough to a threshold that the
