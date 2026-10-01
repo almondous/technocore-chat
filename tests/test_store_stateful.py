@@ -29,6 +29,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from _client import _competing_reap_after_marker_read
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
@@ -111,10 +112,10 @@ class StoreLifecycle(RuleBasedStateMachine):
             # A ring a few messages wide, so compaction is part of an ordinary run.
             "MAX_ROOM_BYTES": RING_BYTES,
             "COMPACT_KEEP_BYTES": RING_BYTES // 2,
-            # Every write reaps. The production throttle makes "did this step reap?" a
-            # function of wall-clock time, which is the one thing a model must not guess.
+            # Reap rules drive maintenance explicitly: a write never walks the store.
+            # Every explicit attempt is due, independent of wall-clock scheduling.
             "REAP_EVERY": 0,
-            # A sampled digest of the same numbers: another file to age, nothing to check.
+            # Snapshot rules override this interval when driving the background job.
             "SNAPSHOT_EVERY": 1 << 30,
         }
         self.saved = {name: getattr(store, name) for name in tuning}
@@ -180,8 +181,8 @@ class StoreLifecycle(RuleBasedStateMachine):
         return "gone"
 
     def _reap_model(self) -> None:
-        """Apply the reaper's rules to the model, wherever the store would have run a pass
-        — which, with REAP_EVERY at zero, is before every append and every note write."""
+        """Apply the reaper's rules to the model, wherever the store runs a pass — which is
+        only the `reap` rule now: writes no longer reap on their way in (#896)."""
         for room in ROOMS:
             if self._room_verdict(room) == "gone":
                 # #139: a reaped room leaves its high-water mark in a floor map so a
@@ -239,7 +240,6 @@ class StoreLifecycle(RuleBasedStateMachine):
     def say(self, room: str, nick: str, texts: list[str]) -> None:
         """A burst rather than one line: a step budget spent one message at a time never
         fills a ring, and compaction is only reachable from a room with a history."""
-        self._reap_model()
         for text in texts:
             record = store.append(self.root, room, nick, text)
             assert record["seq"] == self.seq[room] + 1, (
@@ -325,7 +325,6 @@ class StoreLifecycle(RuleBasedStateMachine):
 
     @rule(key=st.sampled_from(NOTES), value=SAFE_TEXT)
     def write_note(self, key: tuple[str, str], value: str) -> None:
-        self._reap_model()
         store.note_set(self.root, *key, value)
         self.notes[key] = value
         self.note_age[key] = 0
@@ -336,7 +335,6 @@ class StoreLifecycle(RuleBasedStateMachine):
         """The only ordering primitive a note has, and what an accumulator is built on: it
         must win exactly when the value it was handed is still there, and lose with the
         *actual* value attached so the loser can rebase without a second read."""
-        self._reap_model()
         current = self.notes.get(key)
         expect = current if (use_current and current is not None) else f"stale-{value}"
         try:
@@ -354,7 +352,6 @@ class StoreLifecycle(RuleBasedStateMachine):
 
     @rule(key=st.sampled_from(NOTES), value=SAFE_TEXT)
     def create_if_absent(self, key: tuple[str, str], value: str) -> None:
-        self._reap_model()
         existed = self.notes.get(key)
         try:
             store.note_set(self.root, *key, value, expect_absent=True)
@@ -415,6 +412,64 @@ class StoreLifecycle(RuleBasedStateMachine):
 
         self._reap_model()
         self._resync()
+
+    @rule()
+    def competing_reapers(self) -> None:
+        """Two workers seeing a due marker must share one pass through this lifecycle."""
+        with (
+            patch.object(store, "REAP_EVERY", 600),
+            patch.object(store, "_reap_pass", wraps=store._reap_pass) as passes,
+            _competing_reap_after_marker_read(self.root) as raced,
+        ):
+            self.reap()
+            assert raced
+            assert passes.call_count == 1, "a competing worker repeated the store walk"
+
+    @rule(ahead=st.sampled_from([1, 3600, 86400]))
+    def reap_after_clock_rollback(self, ahead: int) -> None:
+        """A future throttle marker permits one pass, then normal throttling resumes."""
+        marker = self.root / ".reaped"
+        marker.touch()
+        future = store.time.time() + ahead
+        os.utime(marker, (future, future))
+        with (
+            patch.object(store, "REAP_EVERY", 600),
+            patch.object(store, "_reap_pass", wraps=store._reap_pass) as passes,
+        ):
+            self._reap_model()
+            store._reap(self.root)
+            assert passes.call_count == 1, "a future marker suppressed maintenance"
+            self._resync()
+            assert marker.stat().st_mtime <= store.time.time()
+            store._reap(self.root)
+            assert passes.call_count == 1, "the recovered marker did not throttle"
+
+    @rule(fail_publication=st.booleans())
+    def sample_outstanding_work(self, fail_publication: bool) -> None:
+        """A failed publication retains work across arbitrary intervening store operations."""
+        marker = self.root / store.SNAPSHOTS_FILE
+        pending = self.root / ".snapshot-pending"
+        inflight = self.root / ".snapshot-inflight"
+        before = marker.read_bytes() if marker.exists() else None
+        work = bool(store._PENDING.get(self.root, {}).get("messages"))
+        work = work or pending.exists() or inflight.exists()
+        replace = store._replace
+
+        def publish(path, data, *args, **kwargs):
+            if fail_publication and path == marker:
+                raise OSError("snapshot publication failed")
+            return replace(path, data, *args, **kwargs)
+
+        with patch.object(store, "SNAPSHOT_EVERY", 0), patch.object(store, "_replace", publish):
+            store._snapshot(self.root)
+        if fail_publication and work:
+            assert inflight.exists(), "a failed sample lost its outstanding work"
+            assert (marker.read_bytes() if marker.exists() else None) == before
+        elif work:
+            assert marker.exists()
+            assert not pending.exists() and not inflight.exists()
+        else:
+            assert (marker.read_bytes() if marker.exists() else None) == before
 
     # ------------------------------------------------------------------ invariants
 

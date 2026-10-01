@@ -90,8 +90,7 @@ def test_room_disk_is_capped_independently_of_the_room_count(tmp_path, monkeypat
     store.append(tmp_path, "room0", "bot", "x" * 300)  # room0 + events ≈ 452B, over budget
     # The reaper is what establishes the byte figure the cap reads (#578): the create path
     # stopped walking every bucket per new room, so the budget bites off the last pass.
-    (tmp_path / ".reaped").unlink()
-    store._reap(tmp_path)
+    _reap_now(tmp_path)
     with pytest.raises(store.StoreError, match="room storage is full") as refused:
         store.append(tmp_path, "overflow", "bot", "hi")
     message = str(refused.value)
@@ -214,14 +213,14 @@ def test_the_reaper_records_room_usage_for_the_ring_to_read(tmp_path, monkeypatc
 
     assert store.room_bytes_used(tmp_path) == 0  # nothing recorded yet reads as no pressure
 
-    monkeypatch.setattr(store, "REAP_EVERY", 0)  # a pass on every write, not once per 300s
     store.append(tmp_path, "somewhere", "bot", "hi")
-    store.append(tmp_path, "somewhere", "bot", "again")  # this pass sees the room on disk
+    _reap_now(tmp_path)  # this pass sees the room on disk
     before = store.room_bytes_used(tmp_path)
     assert before > 0
 
     for _ in range(20):
         store.append(tmp_path, "somewhere", "bot", "x" * 200)
+    _reap_now(tmp_path)
     assert store.room_bytes_used(tmp_path) > before
 
 
@@ -336,11 +335,9 @@ def test_orphan_locks_are_swept(tmp_path):
     assert lock.exists()
     for p in (path, lock):
         _age(p, store.IDLE_SECONDS + 60)
-    _arm_reaper(tmp_path)
-    store.append(tmp_path, "other", "bot", "hi")  # reaps the data file, keeps its lock
+    _reap_now(tmp_path)  # reaps the data file, keeps its lock
     assert not path.exists()
-    _arm_reaper(tmp_path)
-    store.append(tmp_path, "other", "bot", "again")  # next pass sweeps the orphan lock
+    _reap_now(tmp_path)  # next pass sweeps the orphan lock
     assert not lock.exists()
 
 
@@ -510,12 +507,18 @@ def test_reap_keeps_a_file_refreshed_after_the_stat(tmp_path, monkeypatch):
     store.append(tmp_path, "live", "bot", "hi")
     path = store.room_path(tmp_path, "live")
     _age(path, store.IDLE_SECONDS + 60)
+    refreshed = []
 
     def refresh(target):
-        os.utime(target, None)  # a writer got in between the stat and the unlink
+        # Only the room write races the unlink; touching the scheduling marker here
+        # would suppress the whole pass instead of exercising its under-lock recheck.
+        if target == path:
+            os.utime(target, None)
+            refreshed.append(target)
 
     _race_under_lock(monkeypatch, store, refresh)
     _reap_now(tmp_path)
+    assert refreshed == [path], "the pass never reached the competing room write"
     assert path.exists()
 
 
@@ -583,7 +586,7 @@ def test_idle_rooms_are_reaped_so_squatting_expires(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "MAX_ROOMS", 2)
     store.append(tmp_path, "squat", "bot", "hi")
     _age(store.room_path(tmp_path, "squat"), store.IDLE_SECONDS + 60)
-    _arm_reaper(tmp_path)  # force a reap pass
+    _reap_now(tmp_path)
     store.append(tmp_path, "fresh", "bot", "hi")
     assert not store.room_path(tmp_path, "squat").exists()
     assert store.room_path(tmp_path, "fresh").exists()
@@ -837,15 +840,74 @@ def test_reaper_spares_active_files_and_throttles_itself(tmp_path, monkeypatch):
     assert store.room_path(tmp_path, "active").exists()
     assert store.note_get(tmp_path, "ns", "keep") == "value"
 
-    # a reap ran on the first write, so the marker exists and the next pass is throttled
+    # the first pass spares everything live and arms the throttle for the next one
+    store._reap(tmp_path)
+    assert store.room_path(tmp_path, "active").exists()
+    assert store.note_get(tmp_path, "ns", "keep") == "value"
     marker = tmp_path / ".reaped"
     assert marker.exists()
     _age(store.room_path(tmp_path, "other"), store.IDLE_SECONDS + 60)
-    store.append(tmp_path, "active", "bot", "again")
+    store._reap(tmp_path)
     assert store.room_path(tmp_path, "other").exists()  # throttled: not reaped yet
     marker.unlink()
-    store.append(tmp_path, "active", "bot", "third")
+    store._reap(tmp_path)
     assert not store.room_path(tmp_path, "other").exists()  # now it is
+
+
+def test_a_write_never_runs_the_reap_pass(tmp_path, monkeypatch):
+    """#896: the pass ran inline in whichever write crossed REAP_EVERY first, so that one
+    request waited for a walk of the whole store. Armed exactly as that write would have
+    found it — no marker at all — neither write lane may start a pass or arm the throttle."""
+    import store
+
+    ran = []
+    monkeypatch.setattr(store, "_reap_pass", lambda root, now: ran.append(now))
+    _arm_reaper(tmp_path)
+    store.append(tmp_path, "room", "bot", "hi")
+    store.note_set(tmp_path, "ns", "key", "value")
+    assert ran == [], "a write ran the reap pass"
+    assert not (tmp_path / ".reaped").exists(), "a write armed the reaper's throttle"
+    store._reap(tmp_path)  # the pass itself still runs wherever it is actually called
+    assert len(ran) == 1
+
+
+def test_the_reaper_thread_waits_reaps_survives_a_failure_and_stops(tmp_path, monkeypatch, capsys):
+    """The loop each worker runs on a daemon thread (#896). It waits a whole interval before
+    its first pass, so a fresh worker or a test that starts the app is not raced by one; it
+    keeps going through a pass that raises, because a dead reaper thread would stop retirement
+    for the life of the worker; and it exits when told to."""
+    import store
+
+    calls = []
+
+    def flaky_reap(root):
+        calls.append(root)
+        if len(calls) == 1:
+            raise OSError("disk hiccup")
+
+    monkeypatch.setattr(store, "_reap", flaky_reap)
+
+    def run(interval, until):
+        monkeypatch.setattr(store, "REAP_EVERY", interval)
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=store._maintain, args=(tmp_path, stop, store._reap, interval), daemon=True
+        )
+        worker.start()
+        deadline = time.monotonic() + 10
+        while not until() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stop.set()
+        worker.join(10)
+        assert not worker.is_alive(), "the reaper ignored its stop event"
+
+    run(60, lambda: True)  # stopped inside its first interval
+    assert calls == [], "the reaper ran a pass before its first interval was up"
+
+    run(0.01, lambda: len(calls) >= 3)
+    assert len(calls) >= 3, "the loop died on the pass that raised"
+    assert set(calls) == {tmp_path}
+    assert "maintenance_failed" in capsys.readouterr().err, "a failed pass was swallowed silently"
 
 
 def test_engagement_flags_a_room_only_one_nick_ever_wrote_in(tmp_path):
@@ -935,18 +997,15 @@ def test_ownership_guards_do_not_expire_out_from_under_a_live_room(tmp_path):
         store.note_set(tmp_path, ns, "d-live", value)
         _age(store.note_path(tmp_path, ns, "d-live"), store.IDLE_SECONDS + 60)
 
-    _arm_reaper(tmp_path)
-    store.append(tmp_path, "d-live", "bot", "still talking")  # forces a reap pass
+    _reap_now(tmp_path)
     for ns in (store.OWNERS_NS, store.ALLOW_NS, store.NONCE_NS):
         assert store.note_get(tmp_path, ns, "d-live") is not None, ns
 
     # once the room itself goes, the guards go with it — bounded exactly as before
     _age(store.room_path(tmp_path, "d-live"), store.IDLE_SECONDS + 60)
-    _arm_reaper(tmp_path)
-    store.append(tmp_path, "elsewhere", "bot", "hi")
+    _reap_now(tmp_path)
     assert not store.room_path(tmp_path, "d-live").exists()
-    _arm_reaper(tmp_path)
-    store.append(tmp_path, "elsewhere", "bot", "again")
+    _reap_now(tmp_path)
     for ns in (store.OWNERS_NS, store.ALLOW_NS, store.NONCE_NS):
         assert store.note_get(tmp_path, ns, "d-live") is None, ns
 
@@ -1066,14 +1125,14 @@ def test_message_counter_survives_compaction(tmp_path, monkeypatch):
     assert store.counters(tmp_path)["messages"] == 60  # the counter did not
 
 
-def test_snapshots_accumulate_on_the_write_path_without_a_background_thread(tmp_path, monkeypatch):
-    """The history the digest differences against. Taken by whoever writes next, if due —
-    the same throttle idiom as the reaper, so the service still runs no scheduler."""
+def test_background_samples_accumulate_after_writes(tmp_path, monkeypatch):
+    """The background job preserves the history the digest differences against."""
     import store
 
-    monkeypatch.setattr(store, "SNAPSHOT_EVERY", 0)  # every write is due
+    monkeypatch.setattr(store, "SNAPSHOT_EVERY", 0)  # every maintenance attempt is due
     for i in range(3):
         store.append(tmp_path, "lobby", "bot", f"m{i}")
+        store._snapshot(tmp_path)
     history = store.snapshots(tmp_path)
     assert len(history) == 3
     assert [h["counters"]["messages"] for h in history] == [1, 2, 3]
@@ -1087,6 +1146,7 @@ def test_snapshots_are_throttled_so_a_burst_costs_one_sample(tmp_path):
 
     for i in range(20):
         store.append(tmp_path, "lobby", "bot", f"m{i}")
+        store._snapshot(tmp_path)
     assert len(store.snapshots(tmp_path)) == 1
 
 
@@ -1095,11 +1155,13 @@ def test_snapshots_prune_past_the_retention_window(tmp_path, monkeypatch):
 
     monkeypatch.setattr(store, "SNAPSHOT_EVERY", 0)
     store.append(tmp_path, "lobby", "bot", "old")
+    store._snapshot(tmp_path)
     path = tmp_path / store.SNAPSHOTS_FILE
     stale = json.loads(path.read_text().splitlines()[0])
     stale["t"] = int(time.time() - store.SNAPSHOT_KEEP_SECONDS - 3600)
     path.write_text(json.dumps(stale) + "\n")
     store.append(tmp_path, "lobby", "bot", "new")
+    store._snapshot(tmp_path)
     kept = store.snapshots(tmp_path)
     assert len(kept) == 1 and kept[0]["t"] > stale["t"]
 
@@ -1111,6 +1173,7 @@ def test_snapshots_survive_a_torn_line(tmp_path, monkeypatch):
 
     monkeypatch.setattr(store, "SNAPSHOT_EVERY", 0)
     store.append(tmp_path, "lobby", "bot", "hi")
+    store._snapshot(tmp_path)
     path = tmp_path / store.SNAPSHOTS_FILE
     path.write_text(path.read_text() + '{"t": 1, "coun')
     assert len(store.snapshots(tmp_path)) == 1
@@ -1144,7 +1207,10 @@ def test_a_writer_never_waits_for_a_snapshot_pass_in_another_worker(tmp_path):
     assert store.read_messages(tmp_path, "lobby")["last_seq"] == 1, "the write itself landed"
     assert store.snapshots(tmp_path) == [], "the sample is the running pass's to take"
     store.append(tmp_path, "lobby", "bot", "again")
-    assert len(store.snapshots(tmp_path)) == 1, "and the next writer takes it once it is free"
+    store._snapshot(tmp_path)
+    assert len(store.snapshots(tmp_path)) == 1, (
+        "the next background pass samples once the lock is free"
+    )
 
 
 def test_corrupt_aggregate_metadata_is_ignored_without_inventing_usage(tmp_path):

@@ -151,6 +151,42 @@ cannot use anyway.
 > format is readable by every future engine, so choosing files does not foreclose SQLite or Redis,
 > whereas starting on Redis commits the deployment to a daemon on day one.
 
+### Background store maintenance
+
+Each worker's lifespan owns independent daemon jobs for aggregate snapshots (300 seconds)
+and reaping (600 seconds). They wait before their first attempt; their existing file locks
+and throttle markers coordinate the service-wide passes. Writes do not run either pass,
+and a long reap does not serialize the sampler. The underlying filesystem and GIL can
+still contend; moving the jobs does not make every operation constant-time.
+
+Snapshot work comes from message-counter batches, not comparison of diagnostic counter
+values. Before committing a batch containing messages, the counter writer touches one
+fixed `.snapshot-pending` file. The sampler claims it as `.snapshot-inflight` under the
+short counter lock, releases that lock for collection, publishes the snapshot atomically,
+and acknowledges only the inflight file. All workers flush their local batches before
+checking sampling eligibility, including workers that lose the snapshot lock.
+
+This is at-least-once work: an append racing collection may appear in that sample and
+also leave work for the next one. Failure after publication but before acknowledgement
+can likewise replay a sample after the throttle. With no outstanding append work, time
+alone creates no sample; note-only traffic does not create sampling work. I/O or decoding
+failure preserves the retained history and outstanding work for retry.
+
+Shutdown signals both jobs to stop future attempts and flushes that worker's remaining
+counter batch through the HTTP adapter's existing executor. It does not cancel or join
+an in-flight scan: a daemon can finish while the process drains or be interrupted at exit,
+as with #901's reaper. No partial walk is published just to stop sooner. Fixed work files
+support worker-interruption recovery, not additional power-loss durability. A hard kill
+can still lose a message delta held only in process memory; a failed final counter flush
+retains that delta only while the process remains alive.
+
+Counter and snapshot formats are unchanged during a rolling upgrade. Legacy workers
+ignore the two work files and still sample inline, so the request-latency guarantee
+applies only after those workers drain. A new worker may sample outstanding work an old
+inline sampler already included; that is an allowed duplicate. Work files track upgraded
+workers' batches, not a retroactive log of legacy activity. Rolling back needs no format
+migration: old code leaves these fixed marker files unused.
+
 ---
 
 ## 2. Log capping & rotation

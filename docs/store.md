@@ -12,6 +12,7 @@ via stdlib `inspect` — never edited by hand; a test regenerates and diffs this
 - `last_seq(root: pathlib.Path, room: str) -> int` — (undocumented)
 - `list_notes(root: pathlib.Path, ns: str) -> list[str]` — (undocumented)
 - `list_rooms(root: pathlib.Path) -> list[str]` — (undocumented)
+- `maintenance(root: pathlib.Path, run_sync)` — Own this worker's independent maintenance jobs for the application's lifetime.
 - `note_get(root: pathlib.Path, ns: str, key: str) -> str | None` — (undocumented)
 - `note_path(root: pathlib.Path, ns: str, key: str) -> pathlib.Path` — Where a note lives — `notes/<ns>/<shard>/<key>.txt`.
 - `note_set(root: pathlib.Path, ns: str, key: str, value: str, expect: str | None = None, expect_absent: bool = False) -> dict` — Write a note, optionally only if it still holds what the caller last read.

@@ -20,7 +20,7 @@ import time
 import unicodedata
 from collections import Counter
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -259,9 +259,8 @@ COUNTER_KEYS = (
 # is always running — a reader that holds its own history reports "no data" for a full day
 # every time it is restarted or redeployed, and that was the failure worth designing out.
 SNAPSHOTS_FILE = ".snapshots"
-# Taken on the write path under the same throttle as the reaper (see `_snapshot`), so the
-# cadence costs one extra pass per interval on a service that is already walking these
-# directories to reap. Nothing runs in the background.
+# Background samples use their own job and file throttle. Fixed pending/inflight markers
+# preserve append work independently of the diagnostic counters; see `_snapshot`.
 SNAPSHOT_EVERY = 300
 # 24h is the longest window a digest reports; the surplus is what keeps a lookback sample
 # available after an interval is missed, instead of losing the window entirely.
@@ -812,14 +811,24 @@ def _bump(root: Path, **deltas: int) -> None:
         # it is describing, for as long as this process takes to flush. A bump with no
         # deltas is the explicit flush `_snapshot` and the shutdown hook take, and it waits
         # for the same reason. Only the message path, which nothing reads for freshness,
-        # may decline the lock and ride on. `.counters.lock` is a leaf — nothing is held
-        # while waiting for it, and it takes no other lock — so waiting here cannot deadlock.
+        # may decline the lock and ride on. `.counters.lock` is a leaf: its holders never
+        # take another file lock. A sampler can therefore claim under it while holding
+        # `.snapshots.lock` without introducing a cycle.
         with _locked(root / COUNTERS_FILE, nb=deltas.keys() == {"messages"}):
             # Under the flock: read the authoritative file, not a cached snapshot, so a
             # batch from any other process or worker is added to what is really there.
             with _PENDING_LOCK:
                 batch = _PENDING.pop(root, Counter())
+            if not batch:
+                return
+            # Publish append work before its counters. A sampler claims under this same
+            # short lock, so it cannot acknowledge work whose batch is still committing.
+            # Retrying a failed counter write must publish again: another worker may have
+            # consumed the earlier intent while this process kept the uncommitted delta.
+            if batch["messages"]:
+                (root / ".snapshot-pending").touch()
             _replace(root / COUNTERS_FILE, orjson.dumps(dict(Counter(counters(root)) + batch)))
+            batch.clear()  # an unlock failure must not requeue a batch already on disk
     except OSError:
         # BlockingIOError — EAGAIN, the lock being busy — is a subclass of OSError and is
         # the ordinary path here rather than a failure; a real IO error lands here too and
@@ -1464,7 +1473,7 @@ def service_stats(root: Path, engagement_rooms: int = 50) -> dict:
     one reap interval; here it is the gauge itself, and a fresh store that reported zero
     bytes against rooms it can see would be reporting something it knows to be false. That
     walk is the one this pass just dropped, so it is bounded by the same thing that bounds
-    an unreaped store: appends run reaps.
+    an unreaped store: every worker's reaper thread runs a pass each REAP_EVERY.
     """
     # `ownable`, not `owned`: the `d-` prefix only makes a room *claimable* — until
     # /kv/room-owners/<room> exists the write gate treats it as an ordinary open room, so
@@ -1617,11 +1626,8 @@ def _counted_at(root: Path, name: str) -> tuple[int, int] | None:
     across the whole walk — 29 s at production size, with every create in the service queued
     behind it. It costs one read now, and the span is released before the walk starts.
     """
-    try:
-        with _locked((root / name).with_suffix(".create")):
-            return _read_counts(root, name)
-    except OSError:
-        return None
+    with suppress(OSError), _locked((root / name).with_suffix(".create")):
+        return _read_counts(root, name)
 
 
 def _settle_count(root: Path, name: str, before: tuple[int, int] | None, kept: list[int]) -> None:
@@ -1654,19 +1660,16 @@ def _settle_count(root: Path, name: str, before: tuple[int, int] | None, kept: l
     bytes may be ones a racing rebuild measured before this pass deleted them, and the gauge
     they feed fails open by doctrine (see `room_bytes_used`) where the count fails closed.
     """
-    try:
-        with _locked((root / name).with_suffix(".create")):
-            # An unreadable reading at either end leaves no window at all, and both branches
-            # below then write the walk: `before` for one, the walk against itself for the other.
-            after = _read_counts(root, name) or before or kept
-            if before is None:
-                total, size = max(kept[0], after[0]), kept[1]
-            else:
-                total = kept[0] + max(0, after[0] - before[0])
-                size = kept[1] + max(0, after[1] - before[1])
-            _write_note_count(root, total, size, name=name)
-    except OSError:
-        pass
+    with suppress(OSError), _locked((root / name).with_suffix(".create")):
+        # An unreadable reading at either end leaves no window at all, and both branches
+        # below then write the walk: `before` for one, the walk against itself for the other.
+        after = _read_counts(root, name) or before or kept
+        if before is None:
+            total, size = max(kept[0], after[0]), kept[1]
+        else:
+            total = kept[0] + max(0, after[0] - before[0])
+            size = kept[1] + max(0, after[1] - before[1])
+        _write_note_count(root, total, size, name=name)
 
 
 def _split_seq_state(root: Path) -> None:
@@ -1699,24 +1702,21 @@ def _split_seq_state(root: Path) -> None:
 
     Best effort and idempotent: a failure leaves the map in place, `_seq_entry` keeps reading
     it as the fallback, and the next reap tries again. Runs once in the life of a store — and
-    the reap it rides is throttled, so the window where reads still pay the old parse is at
-    most one REAP_EVERY after the first write.
+    the reap it rides runs one REAP_EVERY after a worker starts, so the window where reads
+    still pay the old parse is at most that interval.
     """
     legacy = _seq_state_path(root)
     shards: dict[Path, dict] = {}
-    try:
-        with _locked(legacy):
-            first = not (backup := legacy.with_suffix(".pre-shard")).exists()
-            for room, entry in _read_seq_state(legacy).items():
-                shards.setdefault(_seq_state_path(root, room), {})[room] = entry
-            for path, entries in shards.items():
-                with _locked(path):
-                    shard = _read_seq_state(path)
-                    merged = {**entries, **shard} if first else {**shard, **entries}
-                    _replace(path, orjson.dumps(merged), fsync=config.FSYNC)
-            legacy.replace(backup) if first else legacy.unlink()
-    except OSError:
-        pass
+    with suppress(OSError), _locked(legacy):
+        first = not (backup := legacy.with_suffix(".pre-shard")).exists()
+        for room, entry in _read_seq_state(legacy).items():
+            shards.setdefault(_seq_state_path(root, room), {})[room] = entry
+        for path, entries in shards.items():
+            with _locked(path):
+                shard = _read_seq_state(path)
+                merged = {**entries, **shard} if first else {**shard, **entries}
+                _replace(path, orjson.dumps(merged), fsync=config.FSYNC)
+        legacy.replace(backup) if first else legacy.unlink()
 
 
 def _sweep_orphan_locks(root: Path, now: float, touched: dict[str, set[str]]) -> None:
@@ -1832,36 +1832,43 @@ def _drop_emptied_namespaces(
 
     Per namespace rather than once around the loop: a create only ever needs the directory it
     is entering to stand still, so holding the span across all of them would queue creates
-    behind namespaces they have nothing to do with. Inside the `try` for the reason this whole
-    tail is best effort — `_reap` runs on the request path, and a pass that cannot take the
-    span must skip a cleanup, never fail the create that triggered it.
+    behind namespaces they have nothing to do with. Suppression includes span acquisition:
+    this tail is best effort, so an unreadable tree or a racing create skips this cleanup
+    for the next pass rather than abandoning all the other namespaces.
+    """
+    with suppress(OSError), os.scandir(root / "notes") as namespaces:
+        for ns in namespaces:
+            before, after = before_ns.get(ns.path), _read_counts(Path(ns.path))
+            file = f"{ns.path}{os.sep}{NOTES_FILE}"
+            # Steady at both ends and equal to the walk between them, or never there at
+            # all: nothing to heal. A file that will not parse reads as neither, and the
+            # `or` chain is why the access check costs a syscall only when it decides.
+            fresh = before and after and before[0] == per_ns[ns.path] == after[0]
+            settled = fresh or not (before or after or os.access(file, os.F_OK))
+            if settled and ns.path not in dirs:
+                continue
+            with suppress(OSError), _locked((root / NOTES_FILE).with_suffix(".create")):
+                Path(file).unlink(missing_ok=True)
+                if ns.path in dirs:
+                    # Buckets first: since sharding a namespace's notes sit a level
+                    # further down, so a drained namespace holds empty directories,
+                    # and rmdir refuses those exactly as it refuses notes. Without
+                    # this the namespace below never goes.
+                    _prune(ns.path)
+                    os.rmdir(ns.path)  # rmdir refuses a directory with entries
+
+
+def _recent(marker: Path, interval: int, now: float) -> bool:
+    """Share the maintenance throttle's unlocked fast check and locked recheck.
+
+    Missing or future markers permit a pass: after a wall-clock rollback the job must
+    restamp its marker rather than wait for that old clock to catch up. Other errors remain
+    the caller's decision: snapshots are best effort, while unreadable reaper state is not due.
     """
     try:
-        with os.scandir(root / "notes") as namespaces:
-            for ns in namespaces:
-                before, after = before_ns.get(ns.path), _read_counts(Path(ns.path))
-                file = f"{ns.path}{os.sep}{NOTES_FILE}"
-                # Steady at both ends and equal to the walk between them, or never there at
-                # all: nothing to heal. A file that will not parse reads as neither, and the
-                # `or` chain is why the access check costs a syscall only when it decides.
-                fresh = before and after and before[0] == per_ns[ns.path] == after[0]
-                settled = fresh or not (before or after or os.access(file, os.F_OK))
-                if settled and ns.path not in dirs:
-                    continue
-                try:
-                    with _locked((root / NOTES_FILE).with_suffix(".create")):
-                        Path(file).unlink(missing_ok=True)
-                        if ns.path in dirs:
-                            # Buckets first: since sharding a namespace's notes sit a level
-                            # further down, so a drained namespace holds empty directories,
-                            # and rmdir refuses those exactly as it refuses notes. Without
-                            # this the namespace below never goes.
-                            _prune(ns.path)
-                            os.rmdir(ns.path)  # rmdir refuses a directory with entries
-                except OSError:
-                    continue  # a tree we may not write, or a create that got there first
-    except OSError:
-        pass  # no notes yet, or nothing readable: no count to heal and no namespace to drop
+        return 0 <= now - marker.stat().st_mtime < interval
+    except FileNotFoundError:
+        return False
 
 
 def _reap(root: Path) -> None:
@@ -1876,8 +1883,8 @@ def _reap(root: Path) -> None:
     One pass at a time across the whole service, which the timestamp alone did not buy:
     reading the marker and touching it are two unserialised operations, so two of the ~230
     workers arriving together on an interval boundary both passed the check — and a walk that
-    takes longer than REAP_EVERY is overlapped by the next writer however the check is
-    written. Two passes interleaved write a count *below* the disk: the second deletes and
+    takes longer than REAP_EVERY is overlapped by the next worker's reaper however the check
+    is written. Two passes interleaved write a count *below* the disk: the second deletes and
     settles while the first is still walking, and the first then installs a figure measured
     against a window the second has already spent (see `_settle_count`). So the marker
     carries a lock as well as a timestamp, taken non-blocking around the whole pass — a caller
@@ -1885,24 +1892,62 @@ def _reap(root: Path) -> None:
     refused it a moment later anyway. Nothing else ever takes this lock, so it orders against
     nothing and cannot deadlock.
 
-    The throttle itself stays outside that lock, and the touch with it, exactly where they
-    were: the lock is a mutex on the pass, not on the marker, and arming the throttle before
-    the walk starts is what keeps a 30 s pass from being re-run by the very next writer.
+    Keep the first throttle check unlocked so ordinary writes need no maintenance lock,
+    but recheck and arm it under that lock. A worker can observe an old marker, pause until
+    another pass finishes, then acquire a free lock: exclusion alone would let it repeat
+    the entire walk. A caller that loses the lock must not move the marker either, since
+    it has done no work to postpone the next eligible pass.
     """
     marker = root / ".reaped"
     now = time.time()
-    try:
-        if now - marker.stat().st_mtime < REAP_EVERY:
+    if _recent(marker, REAP_EVERY, now):
+        return
+    with suppress(BlockingIOError), _locked(marker, nb=True):
+        now = time.time()
+        if _recent(marker, REAP_EVERY, now):
             return
-    except FileNotFoundError:
-        pass
-    root.mkdir(parents=True, exist_ok=True)
-    marker.touch()
+        marker.touch()
+        _reap_pass(root, now)
+
+
+def _maintain(root: Path, stop: threading.Event, operation, interval: float) -> None:
+    """Run one maintenance job independently, outside the request pool.
+
+    Each worker owns one thread per job. File locks and markers still decide which
+    worker performs the service-wide pass; independent threads keep a long reap from
+    preventing the five-minute sampler from running. A failed pass retries next interval.
+    The first wait preserves the reaper's startup delay and bounds restart work.
+
+    Stop interrupts an idle wait. An in-flight filesystem operation is not cancellable:
+    the daemon may finish its pass during shutdown or be interrupted by process exit,
+    just as with a worker crash. It must not schedule another pass after stop.
+    """
+    while not stop.wait(interval):
+        try:
+            operation(root)
+        except Exception as error:  # noqa: BLE001 - a transient failure must not kill the job
+            config._dbg(0, "maintenance_failed", job=operation.__name__, error=repr(error))
+
+
+@asynccontextmanager
+async def maintenance(root: Path, run_sync):
+    """Own this worker's independent maintenance jobs for the application's lifetime.
+
+    The HTTP adapter supplies its blocking-I/O runner, so final counter flushing uses
+    the same executor as requests. Daemon jobs retain #901's shutdown contract: stop
+    interrupts idle waits and prevents another pass, but an in-flight pass may finish
+    or be interrupted by process exit. Never publish partial reconciliation to stop it.
+    """
+    stop = threading.Event()
     try:
-        with _locked(marker, nb=True):
-            _reap_pass(root, now)
-    except BlockingIOError:
-        return  # a pass is already running in another worker; nothing here waits for it
+        for operation, interval in ((_reap, REAP_EVERY), (_snapshot, SNAPSHOT_EVERY)):
+            threading.Thread(
+                target=_maintain, args=(root, stop, operation, interval), daemon=True
+            ).start()
+        yield
+    finally:
+        stop.set()
+        await run_sync(_bump, root)
 
 
 def _reap_pass(root: Path, now: float) -> None:
@@ -1981,7 +2026,7 @@ def _reap_pass(root: Path, now: float) -> None:
                         if stillborn_rule:
                             reaped[f"reaped_{reason}"] += 1
             except OSError:
-                continue  # racing writer or vanished file: next pass picks it up
+                continue  # vanished or unreadable files retry on the next pass
     if any(reaped.values()):  # one lock for the whole pass, not one per deleted room
         _bump(root, **reaped)
     _sweep_orphan_locks(root, now, touched)
@@ -2000,20 +2045,21 @@ def _reap_pass(root: Path, now: float) -> None:
     # every create in the store queues on; a bucket only ever needs removing if this pass
     # emptied it. After the sweep, so a bucket whose last orphan lock has just gone is reached.
     for d in touched["rooms"] - {str(root / "rooms")}:  # a flat legacy room's dirname IS that
-        try:
-            with _locked((root / USAGE_FILE).with_suffix(".create")):
-                os.rmdir(d)  # empty buckets only: rmdir refuses a directory with entries
-        except OSError:
-            continue  # best effort, like the rest of the tail: the next pass tries again
+        with suppress(OSError), _locked((root / USAGE_FILE).with_suffix(".create")):
+            os.rmdir(d)  # a refilled or unreadable bucket remains for the next pass
 
 
 def snapshots(root: Path) -> list[dict]:
     """Stored samples, oldest first. Each carries `t` (unix seconds) and the aggregates
-    `service_stats` returns. A torn last line costs that one sample, never the history."""
+    `service_stats` returns. Malformed JSON lines are skipped; I/O and UTF-8 decode
+    failures propagate so callers cannot mistake unreadable history for an empty file."""
     out = []
+    # A failed read is not an empty history: _snapshot rewrites this same file.
+    # Its best-effort boundary also handles decode failures: UnicodeDecodeError is a
+    # ValueError, but unlike a malformed JSON line it prevents reading the entire history.
     try:
         lines = (root / SNAPSHOTS_FILE).read_text(encoding="utf-8").splitlines()
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return out
     for line in lines:
         try:
@@ -2027,61 +2073,43 @@ def snapshots(root: Path) -> list[dict]:
 
 
 def _snapshot(root: Path) -> None:
-    """Append one aggregate sample, at most once per SNAPSHOT_EVERY, pruning past
-    SNAPSHOT_KEEP_SECONDS.
+    """Flush this worker and sample outstanding append work outside request threads.
 
-    Throttled off a marker's mtime exactly like `_reap`, and called from the same place, so
-    this service still has no background thread, no scheduler and no lifespan hook — the
-    two periodic jobs are both "whoever writes next, if it is due". The cost is one extra
-    directory walk per interval on a path that is already walking those directories to
-    reap, and it is what lets `/stats` answer a growth question with stored numbers rather
-    than the caller keeping its own history.
+    Two fixed empty files carry work independently of best-effort lifetime counters:
+    counter corruption/reset must never make a later append look already sampled. Every
+    worker flushes before checking the throttle, even if another worker wins the sample.
+    Message-only batches retain the existing in-memory hard-kill loss boundary.
+    File handoff recovers worker interruption, not power loss: these metadata writes
+    deliberately inherit the existing best-effort atomic-replace durability policy.
 
-    A consequence worth naming: an idle service takes no samples. That is correct — with
-    no writes there is no new traffic to record — but it means the newest sample can be
-    older than the interval, which is why every sample carries its own timestamp instead of
-    the reader assuming a fixed cadence.
-
-    Locked like `_reap` too, non-blocking, and for the same reason: a writer that cannot have
-    the lock is one whose sample is already being taken. Waiting for it bought nothing but
-    latency — the pass walks every room with the lock held, ~4.7 s at ~239k rooms on 0.14.2,
-    and every writer that found the sample due queued behind it holding a threadpool token (91
-    at once, measured), only to find the marker fresh when it got in. Unlike `_reap` nothing
-    is touched before the pass: the marker is the data, so it is replaced at the end or not at
-    all, and the re-check under the lock still turns away a writer that stat'ed it just before.
-
-    Best effort, like `_log_event` and `_bump`: the caller's write has already succeeded.
+    Claim and batch publication share the short counters lock, but collection does not.
+    A racing append creates new pending work; only the claimed inflight file is removed
+    after successful publication. Failure leaves work for another worker or a restart.
+    This is at-least-once: a completed sample may include a racing append whose pending
+    work triggers another sample, or be replayed after a publish-before-ack crash. Quiet
+    services with no outstanding append work take no sample merely because time passed.
     """
+    _bump(root)
     marker = root / SNAPSHOTS_FILE
-    now = time.time()
-    try:
-        if now - marker.stat().st_mtime < SNAPSHOT_EVERY:
+    pending, inflight = root / ".snapshot-pending", root / ".snapshot-inflight"
+    with suppress(OSError, UnicodeDecodeError):
+        if _recent(marker, SNAPSHOT_EVERY, time.time()):
             return
-    except FileNotFoundError:
-        pass
-    except OSError:
-        return
-    try:
         with _locked(marker, nb=True):
-            # Re-check under the lock: two writers racing the stat above would otherwise
-            # both take a sample, and the file is the throttle as well as the data.
-            try:
-                if time.time() - marker.stat().st_mtime < SNAPSHOT_EVERY:
-                    return
-            except FileNotFoundError:
-                pass
-            # Flush this worker's batched counter deltas first: `_bump` lets a plain message
-            # ride in memory, and a sample taken over the unflushed bucket is exactly the
-            # reading this ring exists to get right — one window short, the next one long.
-            # Only this process's bucket, so a sample can still trail other workers'.
-            _bump(root)
+            now = time.time()
+            if _recent(marker, SNAPSHOT_EVERY, now):
+                return
+            # Read before claiming: unreadable history must survive unchanged (#918).
             kept = [r for r in snapshots(root) if now - r["t"] <= SNAPSHOT_KEEP_SECONDS]
+            with _locked(root / COUNTERS_FILE):
+                try:
+                    pending.replace(inflight)
+                except FileNotFoundError:
+                    if not inflight.exists():
+                        return
             kept.append({"t": int(now), **service_stats(root)})
             _replace(marker, b"".join(orjson.dumps(r) + b"\n" for r in kept))
-    except BlockingIOError:
-        return  # a pass is already running in another worker; nothing here waits for it
-    except OSError:
-        pass
+            inflight.unlink()
 
 
 def _scan(d: Path | str, suffix: str, sized: bool = False) -> tuple[int, int]:
@@ -2331,12 +2359,13 @@ def room_bytes_used(root: Path) -> int:
     """Total room bytes at the last reap pass, or 0 if none has run yet.
 
     0 means "no pressure", which is the right default: on a fresh store there is none, and
-    the first write runs a reap and establishes the real figure. A file written by a build
-    before USAGE_FILE carried a count is a single integer, so it has no second field and
-    reads as that same 0 — the one write this figure gates is a *compaction*, so failing open
-    keeps a full ring for at most one reap interval, where failing closed would compact every
-    room in the store back to its floor on the strength of a parse error. The first reap
-    rewrites it in the two-integer format and it never parses short again.
+    the first pass — one REAP_EVERY after a worker starts — establishes the real figure. A
+    file written by a build before USAGE_FILE carried a count is a single integer, so it has
+    no second field and reads as that same 0 — the one write this figure gates is a
+    *compaction*, so failing open keeps a full ring for at most one reap interval, where
+    failing closed would compact every room in the store back to its floor on the strength
+    of a parse error. The first reap rewrites it in the two-integer format and it never
+    parses short again.
 
     Shares `_read_counts`' parse and deliberately not `_note_totals`, which rebuilds by
     walking what that parse rejects: this runs on the append path, and a walk of every room
@@ -2545,19 +2574,18 @@ def append(
     `?format=json`, `?wait=` for near-real-time, ring retention, the same rate limits.
     """
     rec, created = _write_record(root, room, nick, text, did=did, nonce=nonce, sig=sig)
-    # Counted here rather than in `_write_record`, so the server's own announcements
-    # (`_log_event` writes one per created room) never inflate the message count. This
-    # counts what callers wrote, which is what "new messages" has to mean.
-    _bump(root, messages=1, **({"rooms_created": 1} if created else {}))
     # Only public rooms, and never the events room announcing itself. A `p-` room is a
     # capability URL: announcing it would publish the one secret it has, and announcing it
     # *without* the name would still leak that someone created a private room at this
     # instant, which is correlatable with whoever was active. So: nothing at all.
     if created and room != EVENTS_ROOM and not unlisted(room):
         _log_event(root, f"created {room}")
-    # Last, so the sample includes this write and any announcement it produced. Throttled
-    # internally — the common call is one stat of a marker file.
-    _snapshot(root)
+    # Publish this append's work only after its announcement: a fast sampler must not
+    # acknowledge the append before all of the effects it is sampling have happened.
+    # Counted here rather than in `_write_record`, so the server's own announcements
+    # (`_log_event` writes one per created room) never inflate the message count. This
+    # counts what callers wrote, which is what "new messages" has to mean.
+    _bump(root, messages=1, **({"rooms_created": 1} if created else {}))
     return rec
 
 
@@ -2640,7 +2668,6 @@ def _write_record(
         # a missing one means "not re-verifiable", never "invalid".
         if sig is not None:
             rec["sig"] = sig
-    _reap(root)
     # No check before the gate any more. That one existed because taking the gate meant
     # queueing behind every other create in the store, so a rotating room name flooding
     # rejections had to be shed before it got there — and because the check it repeated was a
@@ -2767,12 +2794,11 @@ def note_set(
     path = note_path(root, ns, key)
     ns_dir = _note_ns_dir(root, ns)
     value = clean_text(value, MAX_VALUE_CHARS)
-    _reap(root)
     # A missing note cannot satisfy CAS. Refuse before the create gate makes a sidecar
     # and namespace: those artifacts survive a failed reservation but consume no quota.
-    # Reap first: the sweep can remove an idle note that existed at request entry.
     # This is a valid observation even if another caller creates immediately afterwards;
-    # existing notes still compare under the lock below.
+    # existing notes still compare under the lock below. No reap runs here any more
+    # (#896): an idle note the background pass has not reached yet is still a note.
     if expect is not None and not path.exists():
         raise StoreConflictError(f"note {ns}/{key} changed since you read it", None)
     # No cap check before the gate any more. One ran here to shed a full store's worth of

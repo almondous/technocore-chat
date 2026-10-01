@@ -38,6 +38,34 @@ def test_a_graceful_shutdown_flushes_the_batched_counters(client):
     assert config.ROOT not in store._PENDING
 
 
+def test_startup_starts_maintenance_threads_and_shutdown_stops_them(client, monkeypatch):
+    import config
+    import store
+
+    seen, stopped = [], []
+    ready = threading.Event()
+
+    def maintain(root, stop, operation, interval):
+        seen.append((root, operation, interval, threading.current_thread().daemon))
+        if len(seen) == 2:
+            ready.set()
+        stop.wait(10)
+        stopped.append(operation)
+
+    monkeypatch.setattr(store, "_maintain", maintain)
+    with client:
+        assert ready.wait(5)
+        assert set(seen) == {
+            (config.ROOT, store._reap, 600, True),
+            (config.ROOT, store._snapshot, 300, True),
+        }
+        assert not stopped
+    deadline = time.monotonic() + 5
+    while len(stopped) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert set(stopped) == {store._reap, store._snapshot}
+
+
 def test_stats_says_whether_per_ip_limits_are_actually_per_ip(client, monkeypatch):
     """Behind a CDN with no CHAT_CLIENT_IP_HEADER every caller shares one bucket, and the
     per-day room budget then bounds the whole world at once. Silent, and indistinguishable
@@ -240,6 +268,7 @@ def test_stats_serves_the_stored_history_with_the_current_values(stats_client, m
     monkeypatch.setattr(store, "SNAPSHOT_EVERY", 0)
     for i in range(2):
         stats_client.get(f"/r/lobby/say/bot/m{i}")
+        store._snapshot(Path(os.environ["CHAT_ROOT"]))
     view = stats_client.get("/stats", headers={"X-Stats-Token": "s3cret"}).json()
 
     assert [h["counters"]["messages"] for h in view["history"]] == [1, 2]

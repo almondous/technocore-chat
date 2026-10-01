@@ -18,7 +18,7 @@ import secrets
 import time
 import tomllib
 from collections.abc import Mapping
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -1483,7 +1483,8 @@ async def room_post(request: Request) -> Response:
             return signer
 
     # Everything below is blocking disk work: the gate stats the room and walks the rooms
-    # directory, the append takes an flock and fsyncs, and the reaper may run inside it.
+    # directory, and the append takes a flock and fsyncs. Whole-store maintenance is
+    # independent background work; it must never return to this request path.
     # This handler is `async def` because it has to await the request body, so calling that
     # work directly ran it *on the event loop* — at a full store one POST made every other
     # request in flight wait ~385 ms, measured with a /healthz probe. The GET write lanes
@@ -2176,22 +2177,9 @@ def _get_write(path: str, endpoint) -> Route:
     return route
 
 
-@asynccontextmanager
-async def _lifespan(_app):
-    """Flush this worker's batched counter deltas on the way out.
-
-    `store._bump` lets a plain message ride in memory until something structural, the
-    message bound or a snapshot flushes it (#588). Nothing else flushes a worker that is
-    still under the bound when it is told to stop, so without this an ordinary rolling
-    deploy — SIGTERM, which uvicorn turns into a graceful shutdown — would drop what each
-    worker was holding, not just a worker killed hard. That hard-kill window stays: no
-    shutdown hook runs for SIGKILL, and the counters are best effort by contract.
-
-    Shutdown only. There is nothing to do on the way up, and the service still runs no
-    scheduler, no background thread and no startup work.
-    """
-    yield
-    await run_in_threadpool(store._bump, config.ROOT)
+def _lifespan(_app):
+    """Bind the store's jobs to this worker and preserve the HTTP executor for its flush."""
+    return store.maintenance(config.ROOT, run_in_threadpool)
 
 
 # NDJSON is not in the library's default allow-list, and `/r/<room>/export` is the single
