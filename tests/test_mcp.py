@@ -917,7 +917,20 @@ def test_a_redirected_write_is_an_error_not_a_success(mcp, monkeypatch):
     monkeypatch.setattr(mcp.module, "_fetch", moved)
     reply = mcp.call("say", {"room": "lobby", "text": "hello"})
     assert reply.is_error is True
-    assert "nothing was written" in text_of(reply)
+    assert "this write was not confirmed" in text_of(reply)
+
+
+def test_an_unfollowable_read_redirect_does_not_claim_a_write_failed(mcp, monkeypatch):
+    """A redirect without a usable Location can reach this layer for a read too."""
+
+    async def moved(method, url, headers, body, timeout):
+        return 301, "redirect without Location"
+
+    monkeypatch.setattr(mcp.module, "_fetch", moved)
+    reply = mcp.call("read_room", {"room": "lobby"})
+    assert reply.is_error is True
+    assert "this request was not completed" in text_of(reply)
+    assert "write" not in text_of(reply)
 
 
 # ------------------------------------------------------------------ the signed lane

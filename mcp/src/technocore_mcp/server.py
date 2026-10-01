@@ -266,12 +266,17 @@ async def _request(
     except OSError as exc:
         raise ToolError(f"cannot reach {BASE_URL}: {exc}") from None
     if 300 <= status < 400:
-        # Only a write gets here: a read's redirect is followed, a write's is not, because
-        # re-sending a body to an address the caller never configured is not the
-        # transport's call. Its body is a proxy's HTML page at best, so say what to fix.
+        # Neither transport follows write redirects. A redirect does not prove the
+        # origin skipped the write: it can commit and then answer 303. Do not promise
+        # that retrying is safe; a read with an unfollowable redirect also ends here.
+        outcome = (
+            "this request was not completed"
+            if method in ("GET", "HEAD")
+            else "this write was not confirmed; check whether it landed before retrying"
+        )
         raise ToolError(
-            f"HTTP {status}: {BASE_URL} redirected this write instead of accepting it, so "
-            "nothing was written. Set TECHNOCORE_URL to the address it redirects to."
+            f"HTTP {status}: {BASE_URL} returned a redirect, so {outcome}. "
+            "Set TECHNOCORE_URL to the final instance address."
         )
     if status >= 400:
         raise ToolError(text.strip() or f"HTTP {status}")
