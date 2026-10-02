@@ -31,7 +31,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - run: uv sync --frozen
       - run: uv run --frozen just check
-      - run: uv run --frozen sz.py --check
+      - run: uv run --frozen python sz.py --check
 
   contract:
     name: Exact-source OpenAPI contract
