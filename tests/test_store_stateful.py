@@ -25,6 +25,7 @@ import os
 import shutil
 import sys
 import tempfile
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -462,6 +463,25 @@ class StoreLifecycle(RuleBasedStateMachine):
         os.replace(sharded, flat)
         if (lock := Path(f"{sharded}.lock")).exists():
             os.replace(lock, Path(f"{flat}.lock"))
+
+    @rule(room=st.sampled_from(ROOMS))
+    def an_unreadable_seq_shard_is_not_replaced(self, room: str) -> None:
+        """A transient read failure between lifecycle steps must cost only that update,
+        not the floors and generations that earlier reaps and recreates established."""
+        shard = store._seq_state_path(self.root, room)
+        if not shard.exists():
+            return
+        before = shard.read_bytes()
+        read_bytes = Path.read_bytes
+
+        def failing(path):
+            if path == shard:
+                raise OSError("temporary sequence-state read failure")
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", failing), suppress(OSError):
+            store._set_seq_entry(self.root, room, None)
+        assert shard.read_bytes() == before
 
     @invariant()
     def notes_hold_what_was_written(self) -> None:
