@@ -1,0 +1,85 @@
+name: Retained-floor snapshot validation
+
+on:
+  push:
+    branches: [ci/retained-floor-snapshot-20261002]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: retained-floor-snapshot-20261002
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 858a5fc0475ca8089e257ea428a513269c13bdae
+
+jobs:
+  check:
+    name: Frozen canonical checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 858a5fc0475ca8089e257ea428a513269c13bdae
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        with:
+          enable-cache: false
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - run: uv sync --frozen
+      - run: uv run --frozen just check
+
+  contract:
+    name: Exact-source OpenAPI contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 858a5fc0475ca8089e257ea428a513269c13bdae
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        with:
+          enable-cache: false
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - run: uv sync --frozen
+      - run: uv run --frozen just contract
+
+  browser:
+    name: Exact-source Chromium probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 858a5fc0475ca8089e257ea428a513269c13bdae
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        with:
+          enable-cache: false
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - run: uv sync --frozen
+      - name: Install pinned browser dependencies
+        working-directory: tests
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run browser gate against a disposable store
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHAT_ROOT="$(mktemp -d)" uv run --frozen uvicorn --app-dir src app:app --port 8099 --log-level warning &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 30); do
+            kill -0 "$server" || exit 1
+            curl -fsS localhost:8099/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -fsS localhost:8099/healthz >/dev/null
+          node tests/humans_ui_probe.mjs 8099
