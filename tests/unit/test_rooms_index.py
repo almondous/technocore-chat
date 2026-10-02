@@ -24,6 +24,7 @@ import time
 
 import orjson
 
+import roomsindex
 import store  # src/ is on sys.path via pyproject's pytest pythonpath
 
 # --------------------------------------------------------------------------
@@ -32,7 +33,7 @@ import store  # src/ is on sys.path via pyproject's pytest pythonpath
 
 
 def _index_path(root):
-    return root / store.ROOMS_INDEX_FILE
+    return root / roomsindex.ROOMS_INDEX_FILE
 
 
 def _write_index(root, *entries):
@@ -49,7 +50,7 @@ def _write_index(root, *entries):
 
 
 def _read_index(root):
-    return store._read_rooms_index(root)
+    return roomsindex.read(root)
 
 
 def _seed(root, n, prefix="r"):
@@ -139,28 +140,28 @@ class TestFailClosedParsing:
 
 class TestAppendVsCompaction:
     def test_append_between_walk_and_publish_is_carried(self, tmp_path, monkeypatch):
-        """THE regression both reviewers asked for. The compactor walks; an append
-        lands after the walk but before the publish (here: hooked into the seed
-        path's _prune call, which sits exactly between _collect_rooms_index and the
-        publish); the replace must not drop that line — the carry step re-reads the
-        pathname under the exclusive index lock and carries it in."""
+        """THE regression both reviewers asked for. The publisher collects a snapshot;
+        an append lands after that walk but before the publish (hooked on `collect`,
+        which sits exactly between the snapshot and the replace); the replace must not
+        drop that line — the carry step re-reads the pathname under the exclusive index
+        lock and carries it in."""
         _seed(tmp_path, 3)
+        roomsindex.compact(tmp_path)  # the index must exist first, or observe() writes nothing
 
-        real_prune = store._prune
+        real_collect = roomsindex.collect
 
-        def mid_append(rooms_dir):
-            # A REAL append landing between the compaction's walk and its publish:
-            # the room file is written and its index line appended, exactly the
-            # interleaving yukkie3276/Minh3132 described. Restore the real prune
-            # first: the nested append's own lifecycle calls must not recurse back
-            # into this hook. (Mind the argument: _prune gets root/"rooms" — the
-            # append below must target the store ROOT, not that.)
-            monkeypatch.setattr(store, "_prune", real_prune)
-            real_prune(rooms_dir)
+        def collect_then_append(root):
+            # A REAL append landing between the snapshot and the publish: the room file
+            # is written and its index line appended, exactly the interleaving
+            # yukkie3276/Minh3132 described. Restore the hook first so the nested
+            # append's own lifecycle cannot recurse back into it.
+            monkeypatch.setattr(roomsindex, "collect", real_collect)
+            snapshot = real_collect(root)
             store.append(tmp_path, "late", "bot", "mid-compaction create")
+            return snapshot
 
-        monkeypatch.setattr(store, "_prune", mid_append)
-        store._compact_rooms_index(tmp_path)
+        monkeypatch.setattr(roomsindex, "collect", collect_then_append)
+        roomsindex.compact(tmp_path)
 
         assert "late" in _read_index(tmp_path)
         stats = store.room_stats(tmp_path, limit=10)
@@ -178,7 +179,7 @@ class TestAppendVsCompaction:
         """The other half of the Minh3132 interleaving: an append that comes up after
         the replace has committed opens the NEW inode, and its line is readable."""
         _seed(tmp_path, 3)
-        store._compact_rooms_index(tmp_path)
+        roomsindex.compact(tmp_path)
         before = _index_path(tmp_path).read_bytes()
         store.append(tmp_path, "r1", "bot", "after publish")
         after = _index_path(tmp_path).read_bytes()
@@ -189,10 +190,10 @@ class TestAppendVsCompaction:
     def test_compaction_is_idempotent_and_complete(self, tmp_path):
         _seed(tmp_path, 5)
         store.append(tmp_path, "r2", "bot", "duplicate lines for r2 accumulate")
-        store._compact_rooms_index(tmp_path)
+        roomsindex.compact(tmp_path)
         lines = [ln for ln in _index_path(tmp_path).read_bytes().split(b"\n") if ln.strip()]
         assert len(lines) == 6  # 5 rooms + events: exactly one line per room
-        store._compact_rooms_index(tmp_path)
+        roomsindex.compact(tmp_path)
         assert set(_read_index(tmp_path)) == {f"r{i}" for i in range(5)} | {
             store.EVENTS_ROOM,
         }
@@ -203,9 +204,9 @@ class TestAppendVsCompaction:
         the flags, since the carry protocol's correctness rests on them."""
         import inspect
 
-        src = inspect.getsource(store._update_rooms_index)
+        src = inspect.getsource(roomsindex.observe)
         assert "_locked(path, shared=True)" in src
-        csrc = inspect.getsource(store._compact_rooms_index)
+        csrc = inspect.getsource(roomsindex.compact)
         assert "_locked(path)" in csrc
 
 
@@ -225,7 +226,7 @@ class TestReapedRoomsReconciled:
         the O(total rooms) syscall walk #576 exists to remove.
         """
         _seed(tmp_path, 10)
-        store._compact_rooms_index(tmp_path)
+        roomsindex.compact(tmp_path)
         dead = [f"r{i}" for i in range(5)]  # the 5 oldest
         for name in dead:
             store.room_path(tmp_path, name).unlink()
@@ -241,7 +242,7 @@ class TestReapedRoomsReconciled:
 
         # The compaction a reap pass runs right after its deletes reconciles both totals
         # and the listing to what is on disk.
-        store._compact_rooms_index(tmp_path)
+        roomsindex.compact(tmp_path)
         stats = store.room_stats(tmp_path, limit=50)
         assert stats["total"] == 6
         expected_bytes = store.room_path(tmp_path, store.EVENTS_ROOM).stat().st_size
@@ -255,7 +256,7 @@ class TestReapedRoomsReconciled:
         _seed(tmp_path, 3)
         future = time.time() + 3600
         os.utime(store.room_path(tmp_path, "r2"), (future, future))  # r2 now sorts first
-        store._compact_rooms_index(tmp_path)
+        roomsindex.compact(tmp_path)
         store.room_path(tmp_path, "r2").unlink()
 
         stats = store.room_stats(tmp_path, limit=3)
@@ -267,7 +268,7 @@ class TestReapedRoomsReconciled:
         cannot be filled — the index is dead and the walk is the only authority left.
         """
         _seed(tmp_path, 3)
-        store._compact_rooms_index(tmp_path)  # index: r0, r1, r2, events
+        roomsindex.compact(tmp_path)  # index: r0, r1, r2, events
         for name in ("r0", "r1", "r2"):
             store.room_path(tmp_path, name).unlink()  # only events survives
 
@@ -299,7 +300,7 @@ class TestReapedRoomsReconciled:
         (tmp_path / ".reaped").unlink(missing_ok=True)
 
         taken = []
-        monkeypatch.setattr(store, "_collect_rooms_index", lambda root: taken.append(root) or {})
+        monkeypatch.setattr(roomsindex, "collect", lambda root: taken.append(root) or {})
         store._reap(tmp_path)
         assert taken == [], "the reaper must not take a second walk to build the index"
 
@@ -333,7 +334,7 @@ class TestFailedAppendQuarantines:
         append quarantines the index, so the reader fails closed to the walk — where
         the new room is the newest thing on disk and must rank first."""
         _seed(tmp_path, 5)
-        store._compact_rooms_index(tmp_path)
+        roomsindex.compact(tmp_path)
         # Make the next index append fail deterministically (works even as root):
         # the data path is a directory, so open("ab") raises IsADirectoryError.
         _index_path(tmp_path).unlink()
@@ -353,7 +354,7 @@ class TestFailedAppendQuarantines:
         """A pre-existing .corrupt file must not block a later quarantine rename, and
         must never be read as the index."""
         _seed(tmp_path, 3)
-        (tmp_path / (store.ROOMS_INDEX_FILE + ".corrupt")).write_bytes(b"junk")
+        (tmp_path / (roomsindex.ROOMS_INDEX_FILE + roomsindex.CORRUPT_SUFFIX)).write_bytes(b"junk")
         _index_path(tmp_path).unlink()
         _index_path(tmp_path).mkdir()
         store.append(tmp_path, "another", "bot", "hi")
@@ -378,7 +379,7 @@ class TestPopulation:
         _seed(tmp_path, 4)
         assert not _index_path(tmp_path).exists() or _read_index(tmp_path)
         _index_path(tmp_path).unlink(missing_ok=True)
-        store._compact_rooms_index(tmp_path)
+        roomsindex.compact(tmp_path)
         assert set(_read_index(tmp_path)) == {f"r{i}" for i in range(4)} | {store.EVENTS_ROOM}
 
     def test_fresh_stat_wins_over_stale_index_mtime(self, tmp_path):
