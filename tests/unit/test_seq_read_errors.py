@@ -146,7 +146,7 @@ def test_the_reaper_keeps_a_room_until_its_floor_is_recorded(tmp_path, monkeypat
     assert store.room_generation(tmp_path, room) == 2
 
 
-def test_a_generation_update_failure_does_not_fail_a_message_already_written(tmp_path, monkeypatch):
+def test_a_generation_update_failure_precedes_the_message_write(tmp_path, monkeypatch):
     room = "written"
     shard = store._seq_state_path(tmp_path, room)
     replace = store._replace
@@ -158,6 +158,11 @@ def test_a_generation_update_failure_does_not_fail_a_message_already_written(tmp
 
     with monkeypatch.context() as fault:
         fault.setattr(store, "_replace", failed_replace)
-        posted = store.append(tmp_path, room, "bot", "the write already landed")
+        with pytest.raises(OSError):
+            store.append(tmp_path, room, "bot", "not committed")
+    assert not store.room_path(tmp_path, room).exists()
+    assert store.room_generation(tmp_path, room) == 0
+    posted = store.append(tmp_path, room, "bot", "after recovery")
     assert posted["seq"] == 1
     assert store.read_messages(tmp_path, room)["messages"] == [posted]
+    assert store.room_generation(tmp_path, room) == 1

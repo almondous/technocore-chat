@@ -336,10 +336,10 @@ def test_creates_in_different_shards_do_not_serialise_on_one_lock(tmp_path) -> N
     real_set = store._set_seq_entry
     failed = []
 
-    def wait_inside_the_seq_write(root, room, floor):
+    def wait_inside_the_seq_write(root, room, floor, **kwargs):
         if room in rooms:
             together.wait(timeout=10)
-        return real_set(root, room, floor)
+        return real_set(root, room, floor, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(store, "_set_seq_entry", wait_inside_the_seq_write)
