@@ -885,12 +885,12 @@ def _parse(line: bytes) -> dict | None:
             return rec
 
 
-def _retained_floor(path: Path, cutoff: float | None) -> dict | None:
-    """Oldest readable record in the room file (not the response window). Same expiry as read."""
-    with suppress(FileNotFoundError), path.open("rb") as f:
-        for raw in f:
-            if (r := _parse(raw)) is not None and (cutoff is None or not _expired(r, cutoff)):
-                return r
+def _retained_floor(f, cutoff: float | None) -> dict | None:
+    """Use the held descriptor so compaction/reap cannot mix the floor with another ring."""
+    f.seek(0)
+    for raw in f:
+        if (r := _parse(raw)) is not None and (cutoff is None or not _expired(r, cutoff)):
+            return r
 
 
 def read_messages(
@@ -904,9 +904,13 @@ def read_messages(
     # the scan stops there. `last_seq` deliberately does NOT filter — seq must keep
     # advancing past records nobody can read any more, or an expired room would reuse seqs.
     cutoff = _cutoff(room)
-    # Tail open first so a held fd still answers after a concurrent reap; floor is second.
+    # One descriptor for both passes; a replaced or reaped pathname cannot change its ring.
     out, head_seq = [], 0
+    retained, generation = None, None
     with suppress(FileNotFoundError), path.open("rb") as f:
+        # Like export, capture the generation next to open; the small unlocked gap remains.
+        generation = room_generation(root, room)
+        retained = _retained_floor(f, cutoff)
         for raw in reverse_lines(f):
             rec = _parse(raw)
             if rec is None:
@@ -920,7 +924,6 @@ def read_messages(
             if len(out) >= limit:
                 break
     out.reverse()
-    retained = _retained_floor(path, cutoff)
     # Reaped rooms keep a floor high-water (#139). Only apply it when the caller sent a
     # cursor: a plain read of a reaped name still returns last_seq 0 (#585). Empty-window
     # last_seq is the room head (on-disk or floor), never min(since, head): expired e-
@@ -935,7 +938,7 @@ def read_messages(
         "last_seq": out[-1]["seq"] if out else head_seq,
         "first_retained_seq": retained["seq"] if retained else None,
         "first_retained_ts": retained["ts"] if retained else None,
-        "generation": room_generation(root, room),
+        "generation": room_generation(root, room) if generation is None else generation,
     }
 
 
