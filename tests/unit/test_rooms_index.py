@@ -71,6 +71,34 @@ def _age_files(root, names, days=30):
         os.utime(store.room_path(root, name), (old, old))
 
 
+def _unlistable_room(root, name):
+    """Put a room on disk that /rooms must never enumerate, bypassing every writer.
+
+    Written straight to the resolved path because the API refuses to create one: these
+    exist on a real volume (an older validator, a restore, an operator copying a tree in)
+    and the filter has to hold for files nobody in this codebase wrote.
+    """
+    path = store.room_path(root, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"{}\n")
+    return path
+
+
+class _VanishedEntry:
+    """A scandir entry that no longer exists by the time anyone stats it.
+
+    The reaper deletes a file after readdir has already produced the entry, so this is
+    an ordinary interleaving rather than a fault — the tests below use it to reach the
+    `continue` that keeps one dead room from failing a whole pass or a whole page.
+    """
+
+    def __init__(self, name):
+        self.name = name
+
+    def stat(self):
+        raise FileNotFoundError(2, "No such file or directory", self.name)
+
+
 # --------------------------------------------------------------------------
 # Fail-closed parsing (yukkie3276 #1)
 # --------------------------------------------------------------------------
@@ -397,3 +425,278 @@ class TestPopulation:
         assert stats["rooms"][0]["room"] == "r1"
         assert stats["rooms"][1]["room"] == "r0"
         assert stats["rooms"][0]["idle_seconds"] < stats["rooms"][1]["idle_seconds"]
+
+
+# --------------------------------------------------------------------------
+# One room dying mid-walk must not fail the pass or the page
+# --------------------------------------------------------------------------
+
+
+class TestRoomVanishesMidWalk:
+    """The `continue` on a failed stat, in all three places that walk rooms.
+
+    Same interleaving, three consumers: the reaper's snapshot builder, compaction's
+    rebuild walk, and the walk `/rooms` falls back to. A room deleted between readdir
+    and stat is not an error in any of them, and each has to keep going rather than
+    raise out of a finished reap or hand back a short page.
+    """
+
+    def test_rebuild_walk_skips_a_room_deleted_before_its_stat(self, tmp_path, monkeypatch):
+        _seed(tmp_path, 2)
+        real_walk = store._walk
+
+        def walk_with_a_ghost(d, suffix):
+            for e in real_walk(d, suffix):
+                if e.name.endswith("r1.jsonl"):
+                    yield _VanishedEntry(e.name)
+                else:
+                    yield e
+
+        monkeypatch.setattr(store, "_walk", walk_with_a_ghost)
+        index = roomsindex.collect(tmp_path)
+        # r1 is skipped, the other seeded room and events are collected.
+        assert set(index) == {"r0", store.EVENTS_ROOM}
+
+    def test_fallback_walk_skips_a_room_deleted_before_its_stat(self, tmp_path, monkeypatch):
+        """listing()'s own walk: no index at all, and one entry dies under it."""
+        _seed(tmp_path, 3)
+        _index_path(tmp_path).unlink(missing_ok=True)  # force the walk, not the index
+        assert _read_index(tmp_path) == {}
+        real_walk = store._walk
+
+        def walk_with_a_ghost(d, suffix):
+            for e in real_walk(d, suffix):
+                if e.name.endswith("r2.jsonl"):
+                    yield _VanishedEntry(e.name)
+                else:
+                    yield e
+
+        monkeypatch.setattr(store, "_walk", walk_with_a_ghost)
+        page, total, total_bytes = roomsindex.listing(tmp_path, limit=10)
+        names = {name for _, _, name, _ in page}
+        assert "r2" not in names
+        assert names == {"r0", "r1", store.EVENTS_ROOM}
+        assert total == 3  # the ghost is counted by neither the page nor the total
+        assert total_bytes == sum(size for _, size, _, _ in page)
+
+    def test_reap_walk_survives_a_room_deleted_before_its_stat(self, tmp_path, monkeypatch):
+        """End to end: the reaper's walk yields an entry that is already gone, and the
+        pass must still finish — deleting what it can, publishing a complete snapshot."""
+        _seed(tmp_path, 4)
+        _age_files(tmp_path, ["r0", "r1"])
+        (tmp_path / ".reaped").unlink(missing_ok=True)
+
+        real_see = roomsindex.reap_see
+
+        def see_but_stat_raises(root, entry, st):
+            # r0 dies between the walk's readdir and the stat this call is handed. The
+            # pass must skip it — no count, no snapshot entry, no delete — and carry on.
+            if entry.name.endswith("r0.jsonl"):
+                raise FileNotFoundError(2, "No such file or directory", entry.name)
+            real_see(root, entry, st)
+
+        monkeypatch.setattr(roomsindex, "reap_see", see_but_stat_raises)
+        store._reap(tmp_path)  # must not raise
+
+        # r0's file is still on disk (the pass never deleted it) and its old index line
+        # is carried onto the publish, so the index still describes the disk exactly. The
+        # property under test is that the pass FINISHED and stayed truthful, not that the
+        # skipped room vanished — it is still there.
+        on_disk = {e.name[: -len(".jsonl")] for e in store._walk(tmp_path / "rooms", ".jsonl")}
+        assert "r0" in on_disk
+        assert set(_read_index(tmp_path)) == on_disk
+        stats = store.room_stats(tmp_path, limit=50)
+        assert stats["total"] == len(on_disk)
+        assert {r["room"] for r in stats["rooms"]} == on_disk
+
+
+# --------------------------------------------------------------------------
+# collect() and listing() agree on what a room is
+# --------------------------------------------------------------------------
+
+
+class TestUnlistableRoomsStayOut:
+    def test_rebuild_walk_excludes_a_capability_room_on_disk(self, tmp_path):
+        """`collect` is `_listable`-filtered for the same reason `listing`'s walk is: a
+        `p-` room that exists on disk must not become an index entry, because an index
+        entry is authoritative and would surface a capability URL in /rooms."""
+        _seed(tmp_path, 2)
+        _unlistable_room(tmp_path, "p-abcdef123456")
+        index = roomsindex.collect(tmp_path)
+        assert set(index) == {"r0", "r1", store.EVENTS_ROOM}
+        roomsindex.compact(tmp_path)
+        assert "p-abcdef123456" not in _read_index(tmp_path)
+        stats = store.room_stats(tmp_path, limit=50)
+        assert "p-abcdef123456" not in {r["room"] for r in stats["rooms"]}
+        assert stats["total"] == 3  # 2 seeded + events; the p- room counts nowhere
+
+    def test_fallback_walk_excludes_a_capability_room_on_disk(self, tmp_path):
+        """Same filter on the walk, with no index in play — the two must not disagree."""
+        _seed(tmp_path, 1)
+        _unlistable_room(tmp_path, "mb-p-abcdef123456")
+        _index_path(tmp_path).unlink(missing_ok=True)
+        page, total, _ = roomsindex.listing(tmp_path, limit=50)
+        assert {name for _, _, name, _ in page} == {"r0", store.EVENTS_ROOM}
+        assert total == 2
+
+
+# --------------------------------------------------------------------------
+# observe() never builds a partial index
+# --------------------------------------------------------------------------
+
+
+class TestObserveNeverCreatesAPartialIndex:
+    def test_vanished_index_is_not_recreated_from_one_line(self, tmp_path, monkeypatch):
+        """The invariant this module states: the pathname exists only when it is complete.
+
+        An append whose own `open("ab")` fails, and which then finds the file already
+        gone (a concurrent appender quarantined it), must NOT write its single line into
+        the gap. That file would read back as a complete one-room index on a store of
+        thousands, and `listing` — which trusts a short index — would serve a page of one.
+        Absent stays absent; the next reap pass seeds it from a full walk.
+        """
+        _seed(tmp_path, 5)
+        roomsindex.compact(tmp_path)
+        _index_path(tmp_path).unlink()  # quarantined by someone else mid-append
+
+        # Force the shared-hold append down the OSError path with a file that is absent,
+        # which is the state this branch exists to handle.
+        def open_raises_oserror(path, mode="r", *args, **kwargs):
+            raise PermissionError(13, "Permission denied", str(path))
+
+        monkeypatch.setattr("builtins.open", open_raises_oserror)
+        roomsindex.observe(tmp_path, "ghost", 1.0, 5)
+
+        assert not _index_path(tmp_path).exists()
+        # Nothing partial to read, so /rooms walks and sees all six rooms.
+        stats = store.room_stats(tmp_path, limit=50)
+        assert stats["total"] == 6  # 5 seeded + events
+
+    def test_a_failed_append_against_a_real_index_quarantines_it(self, tmp_path):
+        """The other half: an index that exists and cannot be appended to is renamed
+        aside, not left behind as a stale-but-authoritative snapshot."""
+        _seed(tmp_path, 3)
+        roomsindex.compact(tmp_path)
+        _index_path(tmp_path).unlink()
+        _index_path(tmp_path).mkdir()  # open("ab") raises IsADirectoryError
+        roomsindex.observe(tmp_path, "ghost", 1.0, 5)
+        assert not _index_path(tmp_path).exists()
+        assert (tmp_path / (roomsindex.ROOMS_INDEX_FILE + roomsindex.CORRUPT_SUFFIX)).is_dir()
+
+    def test_index_vanishing_mid_append_is_survived_not_raised(self, tmp_path, monkeypatch):
+        """A quarantiner removes the file between the exists-check and the append, so the
+        append raises FileNotFoundError. That is a normal race with a compaction or a
+        peer append, not a fault: observe must swallow it and leave the store walking
+        rather than surfacing an error out of an append whose write already succeeded."""
+        _seed(tmp_path, 3)
+        roomsindex.compact(tmp_path)
+        real_open = open
+
+        def open_raises_filenotfound(path, mode="r", *args, **kwargs):
+            if str(path) == str(_index_path(tmp_path)):
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", open_raises_filenotfound)
+        roomsindex.observe(tmp_path, "ghost", 1.0, 5)  # must not raise
+        assert _read_index(tmp_path)  # the old index is untouched and still readable
+
+    def test_index_quarantined_by_a_peer_appender_is_left_absent(self, tmp_path, monkeypatch):
+        """The append fails with a non-ENOENT OSError AND a peer has already quarantined
+        the file, so the exclusive re-check finds nothing to rename. That must be a
+        no-op: no line written, no file created, nothing raised."""
+        _seed(tmp_path, 3)
+        roomsindex.compact(tmp_path)
+        real_open = open
+
+        def open_fails_after_the_peer_quarantines(path, mode="r", *args, **kwargs):
+            if str(path) == str(_index_path(tmp_path)):
+                _index_path(tmp_path).unlink()  # the peer's rename, landing right here
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", open_fails_after_the_peer_quarantines)
+        roomsindex.observe(tmp_path, "ghost", 1.0, 5)  # must not raise
+        assert not _index_path(tmp_path).exists()
+        stats = store.room_stats(tmp_path, limit=50)
+        assert stats["total"] == 4  # 3 seeded + events, from the walk
+
+
+# --------------------------------------------------------------------------
+# observe_file()'s own failure modes
+# --------------------------------------------------------------------------
+
+
+class TestObserveFileFailureModes:
+    def test_missing_room_file_is_not_observed(self, tmp_path):
+        """The write has succeeded but the file is already gone (reaped between the
+        record landing and this stat): nothing to observe, and no error."""
+        _seed(tmp_path, 2)
+        roomsindex.compact(tmp_path)
+        roomsindex.observe_file(tmp_path, "never-existed")  # must not raise
+        assert "never-existed" not in _read_index(tmp_path)
+
+    def test_unstattable_room_file_is_swallowed(self, tmp_path, monkeypatch):
+        """A stat that raises OSError is the same best-effort contract as a missing file:
+        observe_file is bookkeeping after a write that already succeeded, so it must not
+        turn that success into a failure."""
+        _seed(tmp_path, 2)
+        roomsindex.compact(tmp_path)
+        real_room_path = store.room_path
+
+        def unstattable(root, room):
+            path = real_room_path(root, room)
+            if room == "r0":
+                raise OSError(5, "I/O error", str(path))
+            return path
+
+        monkeypatch.setattr(store, "room_path", unstattable)
+        roomsindex.observe_file(tmp_path, "r0")  # must not raise
+
+    def test_observed_room_appears_in_the_index(self, tmp_path):
+        """The happy path of the helper itself: a real room file is stat'd and observed."""
+        _seed(tmp_path, 2)
+        roomsindex.compact(tmp_path)
+        roomsindex.observe_file(tmp_path, "r0")
+        index = _read_index(tmp_path)
+        st = store.room_path(tmp_path, "r0").stat()
+        assert index["r0"] == (st.st_mtime, st.st_size)
+
+
+# --------------------------------------------------------------------------
+# compact()'s carry loop over a poisoned line
+# --------------------------------------------------------------------------
+
+
+class TestCompactCarrySurvivesPoison:
+    def test_poisoned_line_does_not_abort_the_publish(self, tmp_path):
+        """A line that starts like a record but does not parse must be skipped, not raise:
+        the publish is the tail of a reap that has already deleted its files, and failing
+        here would strand the index at its pre-reap contents — reporting rooms that no
+        longer exist. The carried good lines still land."""
+        _seed(tmp_path, 3)
+        roomsindex.compact(tmp_path)
+        # A line that starts with `{"room":` (so the cheap prefix check lets it through)
+        # and then fails to parse: exactly the shape a torn write leaves behind.
+        late = store.room_path(tmp_path, "late")
+        late.parent.mkdir(parents=True, exist_ok=True)
+        late.write_bytes(b"{}\n")  # on disk, so the carry step keeps its line
+        with open(_index_path(tmp_path), "ab") as f:
+            f.write(b'{"room": not json at all\n')
+            f.write(b'{"room":"late","mtime":9e9,"size":7}\n')
+
+        roomsindex.compact(tmp_path)  # must not raise
+
+        index = _read_index(tmp_path)
+        assert "late" in index  # the parseable carry survived the poisoned neighbour
+        assert set(index) >= {"r0", "r1", "r2", store.EVENTS_ROOM}
+
+    def test_poisoned_line_alone_still_publishes_the_snapshot(self, tmp_path):
+        """With nothing parseable to carry, the snapshot alone is still complete and is
+        still published — a reader must not be left holding the previous file."""
+        _seed(tmp_path, 2)
+        roomsindex.compact(tmp_path)
+        with open(_index_path(tmp_path), "wb") as f:
+            f.write(b'{"room":\n')
+        roomsindex.compact(tmp_path)
+        assert set(_read_index(tmp_path)) == {"r0", "r1", store.EVENTS_ROOM}

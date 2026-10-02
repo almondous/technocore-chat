@@ -118,6 +118,14 @@ def observe(root: Path, room: str, mtime: float, size: int) -> None:
     read must walk instead of serving a snapshot that is silently missing rooms. The
     exists-check rides inside the same shared hold so a quarantine can never land between
     check and append and slip a partial file in behind itself.
+
+    A file that is *already* gone is not re-created from this one line. Re-creating it
+    here would break the invariant this module states outright — the pathname exists only
+    when it is complete — and the breach is reachable, not theoretical: two appenders
+    that both hit an unwritable index, where the first quarantines and the second then
+    writes its single line into a store holding thousands of rooms. `read()` would return
+    that one room as a complete index and `/rooms` would serve a page of one. Absent
+    stays absent until a reap pass seeds it from a full walk.
     """
     path = _path(root)
     line = orjson.dumps({"room": room, "mtime": mtime, "size": size}) + b"\n"
@@ -132,11 +140,10 @@ def observe(root: Path, room: str, mtime: float, size: int) -> None:
     except OSError:
         try:
             with store._locked(path):
-                if not path.exists():
-                    with open(path, "ab") as f:
-                        f.write(line)
-                else:
+                if path.exists():
                     path.rename(root / (ROOMS_INDEX_FILE + CORRUPT_SUFFIX))
+                # else: already quarantined or compacted away. Nothing to do, and nothing
+                # to write — see the docstring's note on not re-creating the pathname.
         except OSError:
             try:
                 path.rename(root / (ROOMS_INDEX_FILE + CORRUPT_SUFFIX))
