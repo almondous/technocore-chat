@@ -1066,11 +1066,12 @@ def _seq_state_path(root: Path, room: str = "") -> Path:
 
 def _read_seq_state(path: Path) -> dict:
     # A shard that parses to anything but an object is not a map of rooms: `[]` used to reach
-    # `.get` and raise AttributeError out of a room read. Absent, torn and hand-edited all
-    # have to mean the same thing here — no state — because this answers a request.
+    # `.get` and raise AttributeError out of a room read. Absent, torn and hand-edited still
+    # mean no state. An I/O failure does not: a caller must not replace an unreadable shard
+    # with one room or retire a legacy map that the split never copied.
     try:
         state = orjson.loads(path.read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (FileNotFoundError, orjson.JSONDecodeError):
         return {}
     return state if isinstance(state, dict) else {}
 
@@ -1111,7 +1112,7 @@ def _seq_entry(path: Path, room: str) -> object:
     try:
         with path.open("rb") as f:
             before, raw, after = os.fstat(f.fileno()), f.read(), os.fstat(f.fileno())
-    except OSError:
+    except FileNotFoundError:
         return None
     seen = _stamp(before)
     stable = seen == _stamp(after)
@@ -1141,8 +1142,9 @@ def _seq_field(root: Path, room: str, key: str) -> int:
     still answers correctly — and it stays safe afterwards because the split renames the old
     file away rather than leaving a second copy to read.
 
-    Coerces here rather than at each caller: both fields are read on the request path, so a
-    hand-edited or truncated map must degrade to 0 (never existed) and never raise.
+    Coerces here rather than at each caller: a hand-edited or truncated map still degrades to
+    0 (never existed). An unreadable map raises instead: returning 0 could restart a reaped
+    room at seq 1 or persist a generation lower than the state that could not be read.
     """
     entry = _seq_entry(_seq_state_path(root, room), room)
     if not isinstance(entry, dict):
@@ -1162,18 +1164,16 @@ def _set_seq_entry(root: Path, room: str, floor: int | None) -> None:
 
     `t` is when the entry was last touched. Nothing reads it yet: it is here so that reclaiming
     entries for rooms long gone — the half of #489 this change does not do, and the one the map
-    was unbounded for — needs no second migration to date what it finds. Best effort, like
-    `_bump`: the caller's write has already succeeded and must not be failed by bookkeeping.
+    was unbounded for — needs no second migration to date what it finds. Failures propagate:
+    the reaper must keep the room until its floor is safely recorded. The create caller alone
+    makes this best effort, because its message has already landed.
     """
     path = _seq_state_path(root, room)
-    try:
-        with _locked(path):
-            gen = _seq_field(root, room, "gen") + (1 if floor is None else 0)
-            state = _read_seq_state(path)
-            state[room] = {"floor": floor or 0, "gen": gen, "t": int(time.time())}
-            _replace(path, orjson.dumps(state), fsync=config.FSYNC)
-    except OSError:
-        pass
+    with _locked(path):
+        gen = _seq_field(root, room, "gen") + (1 if floor is None else 0)
+        state = _read_seq_state(path)
+        state[room] = {"floor": floor or 0, "gen": gen, "t": int(time.time())}
+        _replace(path, orjson.dumps(state), fsync=config.FSYNC)
 
 
 def last_seq(root: Path, room: str) -> int:
@@ -2697,7 +2697,8 @@ def _write_record(
         # discontinuity and resync instead of silently watching a different conversation
         # (#139 dir #3). Also clears the floor the reaper left behind — the recreated room
         # has taken up the sequence where the old one left off, so it must not be reused.
-        _set_seq_entry(root, room, None)
+        with suppress(OSError):  # the message already landed; bookkeeping must not fail it
+            _set_seq_entry(root, room, None)
     return rec, created
 
 
