@@ -176,9 +176,20 @@ USAGE_FILE = ".usage"
 NOTES_FILE = ".notes-count"
 
 # Incremental recency index for /rooms: one JSONL line per room with {room, mtime, size}.
-# Updated on every write, read by room_stats() instead of walking all room files.
-# Format: one JSON object per line, sorted by mtime descending.
+# Written (appended) on every append() and rebuilt (compacted) at reap; room_stats() reads
+# it instead of stat()-ing every room file. Readers never lock; appenders hold
+# ROOMS_INDEX_LOCK shared, and only the reaper's compaction holds it exclusive — see
+# _update_rooms_index and _compact_rooms_index for the publish protocol that makes an
+# append and an atomic replace unable to lose each other's work.
 ROOMS_INDEX_FILE = ".rooms-index"
+# Serializes the index's rewrites (reap compaction) against its appends. Compaction holds
+# it EXCLUSIVE across its snapshot re-read and its one atomic replace; appenders hold it
+# SHARED, so many appenders coexist and only a publisher waits them out — the same shape
+# as USAGE_FILE's create gate. Appends therefore cannot race a replace into a lost update:
+# an append is wholly before the re-read (its line is carried into the replacement) or
+# wholly after it (it opens the new inode behind the replace). Never flock an inode you
+# are about to rename away — locking the pathname through this sidecar is what keeps the
+# lock domain whole across _replace().
 # >= MAX_ROOMS, and exactly MAX_ROOMS unless an operator says otherwise: the reserved
 # namespaces (topic, room-owners, room-allow, room-nonce) hold at most one note per room, so
 # that floor is the invariant that lets EVERY room carry a topic and an owner. Raising
@@ -1402,20 +1413,58 @@ def room_stats(root: Path, limit: int = DEFAULT_LIMIT) -> dict:
     now = time.time()
     limit = max(1, min(int(limit), MAX_LIMIT))
 
-    # Try to use the index first (fast path: reads one file instead of stat()-ing
-    # every room).  The index is append-only and compacted during _reap, so it
-    # may contain stale entries for reaped rooms — the reader dedupes by taking
-    # the last line per room, and _read_rooms_index filters by _listable.
+    # Try the index first (fast path: one file read plus a bounded number of stats,
+    # instead of a stat per room). The index is append-only and compacted during _reap, so
+    # a room reaped in the current pass can still be in it; the checks below discard a
+    # whole dead page rather than trusting it, and an empty result (missing, corrupt, or
+    # unlistable) sends the walk below. Crucially no path here stats every indexed room —
+    # that would be the O(total rooms) syscall walk #576 exists to remove.
     index = _read_rooms_index(root)
+    entries: list[tuple[float, int, str, int]] | None = None
     if index:
-        entries = sorted(
+        # Totals are the index's own view, O(1): `len` and a sum over already-parsed
+        # entries, no syscalls. They are therefore a reap-time contract — a room deleted
+        # by a reap pass still counts until that pass compacts, which it does immediately
+        # after the deletes. Measuring them exactly here would mean one stat per indexed
+        # room, i.e. O(total rooms) syscalls on every /rooms, which is the bug this index
+        # replaced; freshness is enforced on the listing instead (the walk's own totals
+        # are the exact fallback). `.usage` is not usable for this: it counts every
+        # `*.jsonl`, including `p-` capability rooms, which must stay out of the totals.
+        total = len(index)
+        total_bytes = sum(size for _, size in index.values())
+
+        # Re-stat down the recency order: the index mtime can be stale (external utime,
+        # or an appender that recorded before the file's own mtime settled), and
+        # idle_seconds / sort order depend on the actual file mtime. A stat that fails
+        # means the room was reaped after the index last saw it — the entry is dropped
+        # and the next-newest backfills, so a `limit` request returns `limit` rooms while
+        # any exist. The only per-room syscall here, and it is bounded by `limit` plus the
+        # rooms reaped since the last compaction (this pass's take), never by the room
+        # count. If an index claiming a full page cannot deliver one, it is dead — the
+        # disk is the only authority left, and the walk below answers instead.
+        claimed = len(index)
+        pool = sorted(
             [(mtime, size, name) for name, (mtime, size) in index.items()],
             reverse=True,
         )
-        total = len(index)
-        total_bytes = sum(size for _, size in index.values())
-    else:
-        # Fallback: walk all rooms (slow path: O(total rooms))
+        fresh: list[tuple[float, int, str, int]] = []
+        i = 0
+        while i < len(pool) and len(fresh) < limit:
+            mtime, size, name = pool[i]
+            i += 1
+            try:
+                st = room_path(root, name).stat()
+            except OSError:
+                continue  # reaped between index write and stat: skip, backfill behind it
+            fresh.append((st.st_mtime, size, name, st.st_mtime_ns))
+        if len(fresh) < limit and claimed >= limit:
+            index = {}  # claimed a page, delivered less: stale — the walk answers
+        else:
+            entries = sorted(fresh, reverse=True)
+    if entries is None:
+        # Fallback: walk all rooms (slow path: O(total rooms)). Also the answer when the
+        # index was corrupt or wholly stale — total/bytes then come from the same walk,
+        # never from a file that just failed validation.
         all_entries: list[tuple[float, int, str]] = []
         for e in _walk(root / "rooms", ".jsonl"):
             name = e.name[: -len(".jsonl")]
@@ -1428,22 +1477,10 @@ def room_stats(root: Path, limit: int = DEFAULT_LIMIT) -> dict:
                 continue
         all_entries.sort(reverse=True)
         total = len(all_entries)
-        total_bytes = sum(e[1] for e in all_entries)
-        entries = all_entries[:limit]
-
-    # When using the index, re-stat the top `limit` rooms for fresh mtime.
-    # The index mtime can be stale (e.g. after an external utime or _age() in tests),
-    # and idle_seconds / sort order depend on the actual file mtime.  This costs
-    # `limit` stats instead of total-rooms stats — the whole point of the index.
-    if index:
-        fresh: list[tuple[float, int, str, int]] = []
-        for mtime, size, name in entries[:limit]:
-            try:
-                st = room_path(root, name).stat()
-                fresh.append((st.st_mtime, size, name, st.st_mtime_ns))
-            except OSError:
-                continue  # reaped between index write and stat
-        entries = [(m, s, n, ns) for m, s, n, ns in sorted(fresh, reverse=True)]
+        total_bytes = sum(size for _, size, _ in all_entries)
+        entries = [
+            (m, s, n, room_path(root, n).stat().st_mtime_ns) for m, s, n in all_entries[:limit]
+        ]
 
     shown = []
     windows = []
@@ -1479,6 +1516,7 @@ def room_stats(root: Path, limit: int = DEFAULT_LIMIT) -> dict:
         "bytes_capacity": MAX_TOTAL_ROOM_BYTES,
         "engagement": _rollup(windows),
     }
+
 
 def service_stats(root: Path, engagement_rooms: int = 50) -> dict:
     """Whole-service aggregates for the internal `/stats` endpoint. Counters only.
@@ -1974,6 +2012,12 @@ def _reap_pass(root: Path, now: float) -> None:
     # And the directories it emptied, which is the only place a bucket or a namespace can
     # need removing: nothing else in the store deletes.
     touched: dict[str, set[str]] = {"rooms": set(), "notes": set()}
+    # The rooms index this pass publishes, read as the walk goes: {room: (mtime, size)} for
+    # every listable room the pass keeps, fed from the very `st` the count above accumulates
+    # from — so one pass produces the figures and the index, and they agree by construction.
+    # Rooms only, and `_listable`-filtered to match room_stats' own fallback walk, so a `p-`
+    # capability room stays out of the index exactly as it stays out of /rooms.
+    room_index: dict[str, tuple[float, int]] = {}
     for sub, suffix, stillborn_rule in (("rooms", ".jsonl", True), ("notes", ".txt", False)):
         base = f"{root / sub}{os.sep}"
         held, emptied = kept[sub], touched[sub]
@@ -1985,6 +2029,10 @@ def _reap_pass(root: Path, now: float) -> None:
                 st = entry.stat()
                 held[0] += 1
                 held[1] += st.st_size
+                if not by_ns:
+                    name = entry.name[: -len(".jsonl")]
+                    if _listable(name):
+                        room_index[name] = (st.st_mtime, st.st_size)
                 if by_ns:
                     per_ns[_emptied(base, entry.path, True)] += 1
                 if _guards_a_live_room(root, base, entry, now):
@@ -2018,6 +2066,8 @@ def _reap_pass(root: Path, now: float) -> None:
                         p.unlink(missing_ok=True)
                         held[0] -= 1
                         held[1] -= st.st_size
+                        if not by_ns:
+                            room_index.pop(name, None)  # reaped: never carried back into the index
                         emptied.add(d := _emptied(base, entry.path, by_ns))
                         if by_ns:
                             per_ns[d] -= 1
@@ -2026,6 +2076,12 @@ def _reap_pass(root: Path, now: float) -> None:
                             reaped[f"reaped_{reason}"] += 1
             except OSError:
                 continue  # racing writer or vanished file: next pass picks it up
+    # The rooms this pass took are already out of `room_index` — popped at unlink, by the
+    # same walk that counted them — so nothing is removed from the index file here. Deleting
+    # lines in place would race the appends this loop deliberately shares no lock with; the
+    # compaction at the tail replaces the whole file atomically instead. Until it runs, the
+    # old lines are still on disk and room_stats re-stats each one and backfills, so a dead
+    # entry never reaches a listing in that window.
     if any(reaped.values()):  # one lock for the whole pass, not one per deleted room
         _bump(root, **reaped)
     _sweep_orphan_locks(root, now, touched)
@@ -2049,6 +2105,24 @@ def _reap_pass(root: Path, now: float) -> None:
                 os.rmdir(d)  # empty buckets only: rmdir refuses a directory with entries
         except OSError:
             continue  # best effort, like the rest of the tail: the next pass tries again
+    # Compact the rooms index from THIS pass's own walk: the same `st` the loop above took
+    # for every room, so no second pass over the tree — the figure `_settle_count` just
+    # installed and the index are read off one walk and therefore agree.
+    #
+    # Deliberately OUTSIDE the spans above, not beside them: `_settle_count` holds that span
+    # for a read and a replace precisely because nothing that scales with the store may sit
+    # in it, and this is O(rooms). It serializes on ROOMS_INDEX_LOCK instead — exclusive here,
+    # shared for every appender — which is the lock that already makes an append and a
+    # publish unable to lose each other. A room created after the walk passed it is carried
+    # onto the staging file by that publish, so no create span is needed to protect it.
+    #
+    # One line per kept, listable room replaces every accumulated append, which is what takes
+    # the rooms this pass reaped out of the index at the same moment they leave the disk —
+    # the case where a stale index used to keep counting them until a later pass.
+    try:
+        _compact_rooms_index(root, room_index)
+    except OSError:
+        pass  # an index that cannot be written is no worse than no index: /rooms walks
 
 
 def snapshots(root: Path) -> list[dict]:
@@ -2234,6 +2308,32 @@ def _count_notes(root: Path) -> tuple[int, int]:
     return total, size
 
 
+def _collect_rooms_index(root: Path) -> dict[str, tuple[float, int]]:
+    """{room: (mtime, size)} for every listable room, from one walk of rooms/.
+
+    The full-rebuild path: what `_compact_rooms_index` uses when it is called with no
+    snapshot (a manual rebuild, or a test), as opposed to `_reap_pass`, which builds the
+    same dict inline from the stat its own walk already took and passes it in. Walked here
+    rather than shared with the reaper because the reaper needs its walk for other things
+    too, and a second pass is exactly what neither caller wants.
+
+    `_listable`-filtered to match room_stats' own fallback walk, so the two paths agree on
+    what a room is; unlisted rooms stay out of the index exactly as they stay out of
+    /rooms, while still counting toward USAGE_FILE.
+    """
+    index: dict[str, tuple[float, int]] = {}
+    for e in _walk(root / "rooms", ".jsonl"):
+        name = e.name[: -len(".jsonl")]
+        if not _listable(name):
+            continue
+        try:
+            st = e.stat()
+            index[name] = (st.st_mtime, st.st_size)
+        except OSError:
+            continue  # reaped between the readdir and the stat
+    return index
+
+
 def _write_note_count(root: Path, total: int, size: int, name: str = NOTES_FILE) -> None:
     """Replace the totals atomically. Raises rather than swallowing: a caller that cannot
     record a create must not go on to make one, or the cap it just checked means nothing.
@@ -2250,7 +2350,6 @@ def _write_note_count(root: Path, total: int, size: int, name: str = NOTES_FILE)
     _replace(root / name, f"{total} {size}".encode())
 
 
-
 def _read_rooms_index(root: Path) -> dict[str, tuple[float, int]]:
     """Read the rooms index file: {room: (mtime, size)}.
 
@@ -2259,81 +2358,181 @@ def _read_rooms_index(root: Path) -> dict[str, tuple[float, int]]:
     file and an un-compacted one with pending appends both produce the
     correct current state.
 
-    Returns an empty dict if the file doesn't exist or is corrupted,
-    causing room_stats() to fall back to walking.
+    Fail-closed on corruption: returns an empty dict if the file doesn't exist OR any
+    non-blank line fails to validate, and an empty dict sends room_stats() to the walk
+    fallback. Skipping bad lines and keeping the rest was tried and rejected in review:
+    a truncated or half-written file would then read as a *complete* index that happens
+    to be missing rooms, and /rooms would silently omit real rooms — worse than paying
+    the walk. Blank trailing lines are fine; anything else unparseable poisons the file.
     """
     try:
         data = (root / ROOMS_INDEX_FILE).read_bytes()
-        if not data:
-            return {}
-        index: dict[str, tuple[float, int]] = {}
-        for line in data.split(b"\n"):
-            if not line.strip():
-                continue
-            try:
-                entry = orjson.loads(line)
-                name = entry["room"]
-                if not _listable(name):
-                    continue
-                index[name] = (entry["mtime"], entry["size"])
-            except (ValueError, KeyError, TypeError):
-                continue  # malformed line — skip, don't abort
-        return index
     except OSError:
+        return {}  # no index yet — the walk fallback is the normal first-read path
+    if not data:
         return {}
+    index: dict[str, tuple[float, int]] = {}
+    for line in data.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            entry = orjson.loads(line)
+            name = entry["room"]
+            mtime = entry["mtime"]
+            size = entry["size"]
+            if not _listable(name):
+                continue  # well-formed but not a room this service would list
+            if not (isinstance(mtime, (int, float)) and isinstance(size, int) and size >= 0):
+                raise TypeError(name)
+        except (ValueError, KeyError, TypeError):
+            return {}  # one bad line poisons the whole file: fail closed to the walk
+        index[name] = (mtime, size)
+    return index
 
 
 def _update_rooms_index(root: Path, room: str, mtime: float, size: int) -> None:
     """Append one entry to the rooms index (append-only, no rewrite).
 
-    Called from append() after a successful write.  The reader dedupes
-    by taking the last entry per room, so multiple lines for the same
-    room are fine — they cost one 40-byte JSON object on disk and are
-    reconciled on the next compaction pass (which runs during _reap).
+    Called from append() after a successful write. The reader dedupes by taking the last
+    entry per room, so multiple lines for the same room are fine — they cost one ~60-byte
+    JSON object on disk and are folded away at the next compaction.
 
-    On the very first write (index file does not exist), a full compact
-    is performed so the index starts complete — this prevents the
-    "partially-populated index hides pre-existing rooms" bug (#633
-    review comment by yukkie3276).
+    Concurrency (the review finding this version exists to fix): the append takes
+    ROOMS_INDEX_LOCK shared while it writes; compaction takes it exclusive across its
+    re-read and publish. So an append either lands wholly before the compactor's re-read
+    (its line is carried into the replacement) or wholly after the replace (it opens the
+    new inode). There is no third window in which a committed room write's index line is
+    dropped.
+
+    A fresh store with no index file yet does NOT walk here — and does not create the
+    file either. Invariant: the index pathname exists ONLY when it is complete (a
+    compaction seeded it from a full walk). open("ab") would happily create it, and a
+    one-line index on a 239k-room store is the "partially-populated index hides
+    pre-existing rooms" bug from the earlier review rounds, in worse disguise: /rooms
+    would show one room until the next reap. So an absent index means append-nothing
+    and /rooms walks, exactly the pre-PR behavior, until the next reaper pass seeds
+    it whole.
+
+    On any OSError while an index exists, the file is renamed aside rather than
+    trusted: a failed append means the index no longer describes the store, and
+    room_stats must fall back to walking (fail closed) rather than serve a snapshot
+    that is silently missing rooms. Later appends in the same write see it gone and
+    skip, so no partial file can re-appear behind the quarantine.
     """
+    path = root / ROOMS_INDEX_FILE
+    line = orjson.dumps({"room": room, "mtime": mtime, "size": size}) + b"\n"
     try:
-        if not (root / ROOMS_INDEX_FILE).exists():
-            # First write ever — compact from a full walk so the index
-            # starts complete, then append the new entry.
-            _compact_rooms_index(root)
-        line = orjson.dumps({"room": room, "mtime": mtime, "size": size}) + b"\n"
-        with open(root / ROOMS_INDEX_FILE, "ab") as f:
-            f.write(line)
-    except OSError:
-        pass  # best-effort — a missing index is handled by fallback
-
-
-def _compact_rooms_index(root: Path) -> None:
-    """Rebuild the rooms index from a full walk, writing a single-line-per-room file.
-
-    Called from _reap(), which already walks every room under the USAGE_FILE
-    lock — so this is complete, _listable-filtered, race-free and self-healing.
-    The compacted file replaces any accumulated append-only lines.
-    """
-    index: dict[str, tuple[float, int]] = {}
-    for e in _walk(root / "rooms", ".jsonl"):
-        name = e.name[: -len(".jsonl")]
-        if not _listable(name):
-            continue
+        # Shared, not none: this is the lock the reviews found missing, and it is what
+        # makes the carry step in _compact_rooms_index exact rather than best-effort —
+        # the compactor holds this same lock exclusively across its re-read and its
+        # publish, so an appender inside this block is either fully before the re-read
+        # (its line is carried) or fully after the replace (it opens the new inode).
+        # There is no third window. LOCK_SH, because appenders exclude only the
+        # publisher, never each other. No deadlock: the exclusive holder (compaction)
+        # takes no other lock while holding this one, so the room-lock -> index-lock
+        # order here is the only nesting that exists. The exists-check rides inside
+        # the same shared hold, so a quarantine (exclusive) can never land between
+        # check and append and slip a fresh partial file in behind itself.
         try:
-            st = e.stat()
-            index[name] = (st.st_mtime, st.st_size)
+            with _locked(path, shared=True):
+                if not path.exists():
+                    return  # no complete index yet: the first reap seeds it; /rooms walks
+                with open(path, "ab") as f:
+                    f.write(line)
+        except BlockingIOError:
+            # Same process already holds the lock on this file (fcntl locks are per
+            # open file description) — reachable only if a future caller nests an
+            # append under an index-lock holder. Plain append, same invariant: extend
+            # only, never create.
+            if path.exists():
+                with open(path, "ab") as f:
+                    f.write(line)
+    except FileNotFoundError:
+        pass  # raced a quarantine or a compact: gone; /rooms walks until the next seed
+    except OSError:
+        # Best-effort for the write, never for correctness: if an append failed against
+        # an index that already exists, that index is now incomplete, and the reader's
+        # "non-empty index is authoritative" rule would hide rooms behind it. Quarantine
+        # the file so the next read takes the walk. A second writer's concurrent
+        # quarantine (or a reaper's compact) just wins the rename; a FileNotFoundError
+        # from it means it compacted and we appended into the gap — rewrite under the
+        # lock so this room's line survives.
+        try:
+            with _locked(path):
+                if not path.exists():
+                    with open(path, "ab") as f:
+                        f.write(line)
+                else:
+                    path.rename(root / (ROOMS_INDEX_FILE + ".corrupt"))
         except OSError:
-            continue
-    # Write a compacted file: one line per room, sorted by mtime desc
+            try:
+                path.rename(root / (ROOMS_INDEX_FILE + ".corrupt"))
+            except OSError:
+                pass  # nothing left to do; the walk fallback answers for /rooms
+
+
+def _compact_rooms_index(root: Path, index: dict[str, tuple[float, int]] | None = None) -> None:
+    """Rebuild the rooms index from a walk, writing a single-line-per-room file.
+
+    Called from _reap_pass's tail with that pass's own walk (see room_index there), so no
+    second pass over the tree — and, unlike the caller, no create span is held: the
+    appenders this serializes against take ROOMS_INDEX_LOCK, not the gate. When called
+    without a snapshot it walks and stats itself, the full-rebuild path, and so takes
+    _prune's emptied-bucket cleanup with it, which the reaper-owned call must not: the
+    reaper removes emptied buckets itself.
+
+    Publish protocol, for the race the reviews caught: the compacted snapshot is staged
+    through _replace's unique temp name, and — still under ROOMS_INDEX_LOCK exclusive —
+    everything appended to the *pathname* since the walk is re-read and carried onto the
+    staging file before the one atomic replace. Appenders hold the lock shared while
+    writing, so one of them is either wholly inside the re-read window (its line is
+    carried) or wholly after the replace (it opens the new inode). Between the walk and
+    the publish the two views reconcile exactly; nothing is lost in either order.
+    """
+    if index is None:
+        index = _collect_rooms_index(root)
+        _prune(root / "rooms")
     lines = sorted(
-        (
-            orjson.dumps({"room": r, "mtime": m, "size": s})
-            for r, (m, s) in index.items()
-        ),
+        (orjson.dumps({"room": r, "mtime": m, "size": s}).decode() for r, (m, s) in index.items()),
+        key=lambda s: (orjson.loads(s)["mtime"], s),
         reverse=True,
     )
-    _replace(root / ROOMS_INDEX_FILE, b"\n".join(lines) + b"\n" if lines else b"")
+    path = root / ROOMS_INDEX_FILE
+    # The walk is stale by construction: anything appended to the pathname after the
+    # walk ran is newer than every line in it, and _listable was already applied to
+    # those lines by their writer. Carrying them ONTO the snapshot's tail is the whole
+    # point of the publish step — dropping one would be the exact yukkie3276/Minh3132
+    # lost update. (The walk's own rooms are re-derived fresh here; only the tail
+    # beyond the walk needs carrying, and the reader's last-line-per-room dedupe
+    # folds any overlap away harmlessly.)
+    carry: list[bytes] = []
+    carried: set[str] = set()
+    with _locked(path):
+        try:
+            for raw in path.read_bytes().split(b"\n"):
+                if not raw.strip() or not raw.startswith(b'{"room":'):
+                    continue
+                try:
+                    entry = orjson.loads(raw)
+                    name = entry["room"]
+                except (ValueError, KeyError, TypeError):
+                    continue  # poisoned line: _read_rooms_index fail-closes on it anyway
+                if name in carried:
+                    continue  # an earlier line for this room is newer: keep it
+                if not room_path(root, name).exists():
+                    continue  # reaped since the line: carrying it back would resurrect it
+                if name in index and entry["mtime"] <= index[name][0]:
+                    continue  # older than the walk's own view of this room: snapshot wins
+                carry.append(raw)
+                carried.add(name)
+        except OSError:
+            pass  # nothing readable to carry; the snapshot alone is still complete
+        staged = b"\n".join(line.encode() for line in lines)
+        if lines:
+            staged += b"\n"
+        staged += b"".join(raw if raw.endswith(b"\n") else raw + b"\n" for raw in carry)
+        _replace(path, staged)
+
 
 def _ns_totals(d: Path) -> tuple[int, int]:
     """(notes, bytes) in ONE namespace, by walking. The rebuild behind a per-namespace
@@ -2690,18 +2889,22 @@ def append(
         try:
             ev_file = room_path(root, EVENTS_ROOM)
             if ev_file.exists():
-                st_ev = ev_file.stat()
-                _update_rooms_index(root, EVENTS_ROOM, st_ev.st_mtime, st_ev.st_size)
+                with _locked(ev_file):
+                    st_ev = ev_file.stat()
+                    _update_rooms_index(root, EVENTS_ROOM, st_ev.st_mtime, st_ev.st_size)
         except OSError:
             pass
     # Last, so the sample includes this write and any announcement it produced. Throttled
     # internally — the common call is one stat of a marker file.
-    # Update the rooms index for this room
+    # Update the rooms index for this room. Under the room's own lock, so the record's
+    # append and the index line for it cannot interleave with the reaper's walk of the
+    # same room — the lock that protected the record now also orders the index entry.
     try:
         room_file = room_path(root, room)
         if room_file.exists():
-            st = room_file.stat()
-            _update_rooms_index(root, room, st.st_mtime, st.st_size)
+            with _locked(room_file):
+                st = room_file.stat()
+                _update_rooms_index(root, room, st.st_mtime, st.st_size)
     except OSError:
         pass  # Index update is best-effort
     _snapshot(root)
