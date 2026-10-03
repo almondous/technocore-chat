@@ -1,0 +1,73 @@
+name: PR817 exact benchmark validation
+on:
+  push:
+    branches: [ci/pr817-delay-provenance-20261003]
+permissions:
+  contents: read
+jobs:
+  verify:
+    name: ${{ matrix.base }} canonical and live provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        base: [pr817, current-main]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 7646c226e224ca3a0218118d895c0017c531c4b6
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact adoption tree or pinned main integration
+        env:
+          BASE: ${{ matrix.base }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^{tree})" = c26a1e59cacfa440f0d4152056d33f34751f864f
+          if [ "$BASE" = current-main ]; then
+            git diff fc46459ac45ffbebec720899d93bef6f7e82be99^ fc46459ac45ffbebec720899d93bef6f7e82be99 --binary > /tmp/original.patch
+            git diff 7646c226e224ca3a0218118d895c0017c531c4b6^ 7646c226e224ca3a0218118d895c0017c531c4b6 --binary > /tmp/supplement.patch
+            git fetch https://github.com/flop-labs/technocore-chat.git 0e47f770b13cc27e1e2e199d4cdf70a4778c97cc
+            git checkout --detach 0e47f770b13cc27e1e2e199d4cdf70a4778c97cc
+            git apply /tmp/original.patch
+            git apply /tmp/supplement.patch
+            git add bench tests/unit/test_multi_room_reads_bench.py tests/unit/test_multi_room_delay_provenance.py
+            test "$(git write-tree)" = 5e2b4d34fd86e5e9d652bd84e4bb76f74da349e1
+          fi
+          git diff --check
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          enable-cache: false
+      - run: uv sync --frozen
+      - name: Canonical lint types caps and complete test suite
+        run: uv run just check
+      - name: API contract
+        run: uv run just contract
+      - name: Live delay mismatch and matching runs
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          trap 'if [ -n "${server:-}" ]; then kill "$server" 2>/dev/null || true; fi' EXIT
+          uv run python bench/multi_room_fixture.py --root "$root/data" --rooms 4 --messages 3 --text-bytes 8
+          for delay in 0 2.5; do
+            CHAT_ROOT="$root/data" CHAT_RATE_READ=10000 BENCH_DELAY_MS="$delay" PYTHONPATH=.:src uv run uvicorn bench.multi_room_delay_app:app --host 127.0.0.1 --port 8817 --workers 1 --no-access-log &
+            server=$!
+            for i in $(seq 30); do
+              curl -fsS http://127.0.0.1:8817/healthz >/dev/null && break
+              sleep 1
+            done
+            curl -fsS http://127.0.0.1:8817/healthz >/dev/null
+            echo sentinel > "$root/refused.jsonl"
+            set +e
+            uv run python bench/multi_room_reads.py --base-url http://127.0.0.1:8817 --rooms-file "$root/data/benchmark-rooms.json" --output "$root/refused.jsonl" --delay-ms 25 --warmups 1 --repetitions 2 --concurrency 2 --upstream-commit "$(git rev-parse HEAD)"
+            status=$?
+            set -e
+            test "$status" = 4
+            test "$(cat "$root/refused.jsonl")" = sentinel
+            uv run python bench/multi_room_reads.py --base-url http://127.0.0.1:8817 --rooms-file "$root/data/benchmark-rooms.json" --output "$root/matched-$delay.jsonl" --delay-ms "$delay" --warmups 1 --repetitions 2 --concurrency 2 --upstream-commit "$(git rev-parse HEAD)"
+            uv run python bench/summarize_multi_room_reads.py "$root/matched-$delay.jsonl"
+            kill "$server"
+            wait "$server" || true
+            server=""
+          done
