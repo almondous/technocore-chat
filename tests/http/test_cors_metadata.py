@@ -62,6 +62,7 @@ def test_allowed_refusal_exposes_its_retry_delay(cors_client, lane):
     assert response.headers["access-control-allow-origin"] == ORIGIN
     exposed = response.headers.get("access-control-expose-headers", "").lower().split(", ")
     assert "retry-after" in exposed
+    assert "x-room-generation" in exposed
     assert "access-control-allow-credentials" not in response.headers
 
 
