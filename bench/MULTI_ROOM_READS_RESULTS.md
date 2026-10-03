@@ -6,6 +6,11 @@ This is a client-side measurement for [issue #767](https://github.com/flop-labs/
 
 Upstream commit: `20a4457b89ba11254f4aa48217b066884a148d98` (main retrieved 2026-09-08T15:39:08.580Z).
 
+These are historical schema 1 results. The original harness recorded a client-supplied
+25 ms label without verifying the server configuration; the raw files and hashes below
+remain unchanged. They are not server-verified controlled-delay evidence. Rerun with the
+schema 2 harness before relying on the delay label for a controlled comparison.
+
 ## Linux validation and method
 
 - Runner: WSL2 Linux 6.18.33.2, Alpine 3.21.7, CPython 3.12.13, uv 0.12.3.

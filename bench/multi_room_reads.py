@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Benchmark sequential versus bounded-parallel multi-room GETs.
 
-This client never writes. Each room keeps its own cursor and generation, failures stay
+This fixed-fixture benchmark never writes or advances cursors. Generations are recorded,
+not used for polling recovery. Failures stay
 room-local, 429 responses are recorded without retry, and every socket is closed at exit.
 The responses are independent room snapshots; they are not an atomic multi-room snapshot.
 """
@@ -12,6 +13,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import platform
 import time
@@ -24,6 +26,10 @@ from urllib.parse import quote
 import httpx2 as httpx
 
 REQUIRED_FIELDS = {"room", "count", "first_seq", "last_seq", "generation", "messages"}
+
+
+class DelayProvenanceError(ValueError):
+    """A response cannot substantiate the requested controlled delay."""
 
 
 @dataclass(frozen=True)
@@ -90,7 +96,13 @@ def load_specs(path: Path) -> list[RoomSpec]:
     return specs
 
 
-def fetch_room(client: httpx.Client, base_url: str, spec: RoomSpec, timeout: float) -> dict:
+def fetch_room(
+    client: httpx.Client,
+    base_url: str,
+    spec: RoomSpec,
+    timeout: float,
+    expected_delay_ms: float | None = None,
+) -> dict:
     params: dict[str, Any] = {"format": "json", "limit": spec.limit}
     if spec.since is not None:
         params["since"] = spec.since
@@ -102,6 +114,17 @@ def fetch_room(client: httpx.Client, base_url: str, spec: RoomSpec, timeout: flo
             timeout=timeout,
         )
         elapsed = time.perf_counter() - started
+        if expected_delay_ms is not None:
+            reported = response.headers.get("x-benchmark-delay-ms")
+            try:
+                actual = float(reported) if reported is not None else math.nan
+            except ValueError:
+                actual = math.nan
+            if not math.isfinite(actual) or actual < 0 or actual != expected_delay_ms:
+                raise DelayProvenanceError(
+                    f"{spec.room}: expected delay {expected_delay_ms} ms; "
+                    f"server reported {reported!r}; no benchmark output written"
+                )
         size = len(response.content)
         if response.status_code == 429:
             return {
@@ -151,6 +174,8 @@ def fetch_room(client: httpx.Client, base_url: str, spec: RoomSpec, timeout: flo
             "possible_retention_or_limit_gap": truncated,
             "response_digest": digest,
         }
+    except DelayProvenanceError:
+        raise
     except Exception as exc:  # room-local by design; the remaining rooms still run
         return {
             "room": spec.room,
@@ -162,9 +187,13 @@ def fetch_room(client: httpx.Client, base_url: str, spec: RoomSpec, timeout: flo
 
 
 def read_sequential(
-    client: httpx.Client, base_url: str, specs: list[RoomSpec], timeout: float
+    client: httpx.Client,
+    base_url: str,
+    specs: list[RoomSpec],
+    timeout: float,
+    expected_delay_ms: float | None = None,
 ) -> list[dict]:
-    return [fetch_room(client, base_url, spec, timeout) for spec in specs]
+    return [fetch_room(client, base_url, spec, timeout, expected_delay_ms) for spec in specs]
 
 
 def read_parallel(
@@ -173,11 +202,13 @@ def read_parallel(
     specs: list[RoomSpec],
     timeout: float,
     concurrency: int,
+    expected_delay_ms: float | None = None,
 ) -> list[dict]:
     results: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {
-            pool.submit(fetch_room, client, base_url, spec, timeout): spec.room for spec in specs
+            pool.submit(fetch_room, client, base_url, spec, timeout, expected_delay_ms): spec.room
+            for spec in specs
         }
         for future in concurrent.futures.as_completed(futures):
             results[futures[future]] = future.result()
@@ -220,14 +251,15 @@ def run_arm(
     specs: list[RoomSpec],
     timeout: float,
     concurrency: int,
+    expected_delay_ms: float | None = None,
 ) -> dict:
     cpu_started = time.process_time()
     started = time.perf_counter()
     if method == "sequential":
-        results = read_sequential(client, base_url, specs, timeout)
+        results = read_sequential(client, base_url, specs, timeout, expected_delay_ms)
         workers = 1
     else:
-        results = read_parallel(client, base_url, specs, timeout, concurrency)
+        results = read_parallel(client, base_url, specs, timeout, concurrency, expected_delay_ms)
         workers = concurrency
     return _sample(
         method,
@@ -261,11 +293,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.concurrency < 1 or args.timeout <= 0 or args.repetitions < 1 or args.warmups < 0:
         parser.error("invalid concurrency, timeout, repetitions or warmups")
+    if not math.isfinite(args.delay_ms) or args.delay_ms < 0:
+        parser.error("delay-ms must be finite and non-negative")
     specs = load_specs(args.rooms_file)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
         "kind": "metadata",
-        "schema": 1,
+        "schema": 2,
         "upstream_commit": args.upstream_commit,
         "fixture_description": args.fixture_description,
         "environment_note": args.environment_note,
@@ -274,6 +308,7 @@ def main() -> int:
         "room_count": len(specs),
         "limits": sorted({spec.limit for spec in specs}),
         "delay_ms": args.delay_ms,
+        "delay_verification": "x-benchmark-delay-ms on every received room response, including warmups",
         "delay_injection": "ASGI wrapper before each GET /r/* request",
         "connection_reuse": True,
         "parallel_concurrency": args.concurrency,
@@ -286,26 +321,46 @@ def main() -> int:
         "snapshot_semantics": "independent per-room snapshots; not atomic across rooms",
     }
     rows: list[dict] = [metadata]
-    with _client(1) as sequential_client, _client(args.concurrency) as parallel_client:
-        for _ in range(args.warmups):
-            run_arm("sequential", sequential_client, args.base_url, specs, args.timeout, 1)
-            run_arm(
-                "bounded_parallel",
-                parallel_client,
-                args.base_url,
-                specs,
-                args.timeout,
-                args.concurrency,
-            )
-        for repetition in range(args.repetitions):
-            order = ("sequential", "bounded_parallel")
-            if repetition % 2:
-                order = tuple(reversed(order))
-            for method in order:
-                client = sequential_client if method == "sequential" else parallel_client
-                row = run_arm(method, client, args.base_url, specs, args.timeout, args.concurrency)
-                row.update({"kind": "sample", "repetition": repetition})
-                rows.append(row)
+    try:
+        with _client(1) as sequential_client, _client(args.concurrency) as parallel_client:
+            for _ in range(args.warmups):
+                run_arm(
+                    "sequential",
+                    sequential_client,
+                    args.base_url,
+                    specs,
+                    args.timeout,
+                    1,
+                    args.delay_ms,
+                )
+                run_arm(
+                    "bounded_parallel",
+                    parallel_client,
+                    args.base_url,
+                    specs,
+                    args.timeout,
+                    args.concurrency,
+                    args.delay_ms,
+                )
+            for repetition in range(args.repetitions):
+                order = ("sequential", "bounded_parallel")
+                if repetition % 2:
+                    order = tuple(reversed(order))
+                for method in order:
+                    client = sequential_client if method == "sequential" else parallel_client
+                    row = run_arm(
+                        method,
+                        client,
+                        args.base_url,
+                        specs,
+                        args.timeout,
+                        args.concurrency,
+                        args.delay_ms,
+                    )
+                    row.update({"kind": "sample", "repetition": repetition})
+                    rows.append(row)
+    except DelayProvenanceError as exc:
+        parser.exit(4, f"delay provenance error: {exc}\n")
     with args.output.open("w", encoding="utf-8", newline="\n") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")

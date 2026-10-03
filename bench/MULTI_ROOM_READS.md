@@ -5,8 +5,10 @@ rooms, how does one persistent sequential connection compare with one persistent
 pool and a bounded number of concurrent `GET /r/{room}` requests?
 
 It does **not** add a server endpoint, write data over HTTP, or claim that separate room
-responses form an atomic snapshot. It preserves one cursor and generation per room. A room
-failure does not cancel other rooms, a `429` is recorded without retry, and a possible gap
+responses form an atomic snapshot. It repeatedly uses fixed fixture cursors and records
+returned generations; it is not a stateful polling client and does not advance cursors or
+recover after room recreation. A room failure does not cancel other rooms, a `429` is
+recorded without retry, and a possible gap
 between the requested cursor and returned tail is reported.
 
 ## Reproduce
@@ -35,7 +37,16 @@ uv run python bench/summarize_multi_room_reads.py multi-room-raw.jsonl \
 ```
 
 The delay wrapper sleeps once immediately before every room GET reaches the production ASGI
-app. That controls an application-layer delay; it does not reproduce DNS, TCP/TLS handshakes,
+app, then reports its configured delay in `X-Benchmark-Delay-Ms` on each room response,
+including HTTP errors. `--delay-ms` is an expectation, not a server setting: the client
+verifies this header on every received response in both arms, including warmups. A missing,
+invalid or mismatched header aborts with exit 4 before creating or overwriting the output.
+Both delay settings must be finite and non-negative; zero-delay runs are verified too.
+This is local experimental provenance, not authentication of an untrusted server or proof
+of wall-clock timing. Use the wrapper directly, without a caching proxy. Production routes
+and headers are unchanged; the wrapper remains local-only.
+
+That controls an application-layer delay; it does not reproduce DNS, TCP/TLS handshakes,
 a reverse proxy, packet loss, or a real WAN. Both arms request the same rooms, cursors, limits,
 and immutable fixture. Both reuse connections. The parallel arm is capped by `--concurrency`.
 
@@ -43,7 +54,9 @@ The raw JSONL contains one metadata record and one record per measured arm/repet
 includes wall latency, client CPU time, client RSS on Windows, body bytes, errors, gap flags,
 and room-level public metadata. HTTP headers/framing and server resource usage are marked
 `NOT_MEASURED`. The summary reports median, p95, min, max, and sample standard deviation.
-The command exits non-zero on any room error or response-data mismatch.
+The command exits non-zero on any measured room error or response-data mismatch.
+Schema 2 records successful response-header verification. Historical schema 1 files did
+not verify server delay; their labels cannot be retroactively validated by summarizing them.
 
 Delete `.bench-data` only after confirming it is the disposable path you created. The scripts
 never delete it for you.
