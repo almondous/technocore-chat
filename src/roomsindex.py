@@ -234,7 +234,7 @@ def compact(root: Path, index: dict[str, tuple[float, int]] | None = None) -> No
         carried: set[str] = set()
         with store._locked(path):
             try:
-                for raw in path.read_bytes().split(b"\n"):
+                for raw in reversed(path.read_bytes().split(b"\n")):
                     if not raw.strip() or not raw.startswith(b'{"room":'):
                         continue
                     try:
@@ -243,13 +243,25 @@ def compact(root: Path, index: dict[str, tuple[float, int]] | None = None) -> No
                     except (ValueError, KeyError, TypeError):
                         continue  # poisoned line: read() fail-closes on it anyway
                     if name in carried:
-                        continue  # an earlier line for this room is newer: keep it
-                    if not store.room_path(root, name).exists():
-                        continue  # reaped since the line: carrying it back resurrects it
-                    if name in index and entry["mtime"] <= index[name][0]:
-                        continue  # older than the snapshot's view: the snapshot wins
-                    carry.append(raw)
+                        continue  # append order, not mtime, decides which update is last
                     carried.add(name)
+                    try:
+                        st = store.room_path(root, name).stat()
+                    except FileNotFoundError:
+                        continue  # reaped since the line: carrying it back resurrects it
+                    if name in index:
+                        if entry["mtime"] < index[name][0]:
+                            continue  # older than the snapshot's view: the snapshot wins
+                        if entry["mtime"] == index[name][0]:
+                            if entry["size"] == index[name][1]:
+                                continue
+                            # Equal timestamps do not order an append and a snapshot.
+                            # Reuse the existence stat, including shrinkage after rotation;
+                            # taking the room lock here would invert the writer's lock order.
+                            raw = orjson.dumps(
+                                {"room": name, "mtime": st.st_mtime, "size": st.st_size}
+                            )
+                    carry.append(raw)
             except OSError:
                 pass  # nothing readable to carry; the snapshot alone is still complete
             staged = b"\n".join(line.encode() for line in lines)
