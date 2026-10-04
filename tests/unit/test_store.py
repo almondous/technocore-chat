@@ -505,8 +505,9 @@ def test_an_ephemeral_room_keeps_the_history_that_has_not_expired(tmp_path, monk
 
 def test_ephemeral_read_keeps_live_record_before_a_clock_rollback(tmp_path, monkeypatch):
     """A stale record appended after a wall-clock rollback must not hide an older live one."""
-    import store
     from datetime import UTC, datetime, timedelta
+
+    import store
 
     store.append(tmp_path, "e-clock", "bot", "still live")
 
@@ -520,8 +521,9 @@ def test_ephemeral_read_keeps_live_record_before_a_clock_rollback(tmp_path, monk
 
 def test_all_expired_ephemeral_tail_keeps_head_seq(tmp_path, monkeypatch):
     """When every record has expired, a fresh read must still report head_seq."""
-    import store
     from datetime import UTC, datetime, timedelta
+
+    import store
 
     stale = datetime.now(UTC) - timedelta(seconds=store.EPHEMERAL_TTL_SECONDS + 60)
     with monkeypatch.context() as m:
@@ -539,8 +541,9 @@ def test_all_expired_ephemeral_tail_keeps_head_seq(tmp_path, monkeypatch):
 
 def test_all_expired_tail_after_clock_rollback_keeps_head_seq(tmp_path, monkeypatch):
     """Same invariant when the second record was written with a rolled-back clock."""
-    import store
     from datetime import UTC, datetime, timedelta
+
+    import store
 
     fmt = "%Y-%m-%dT%H:%M:%S.%fZ"
     older = datetime.now(UTC) - timedelta(seconds=store.EPHEMERAL_TTL_SECONDS + 600)
