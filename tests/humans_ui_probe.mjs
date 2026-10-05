@@ -1088,6 +1088,63 @@ const browser = await chromium.launch({
 }
 
 
+// ------------------------------------------------------------- empty cursor checkpoints
+// A future permalink gets an empty page whose last_seq corrects the cursor. The next
+// message must appear without reopening the room; the server's successful correction
+// is useful even though there was nothing to render in the first response.
+for (const [label, initial, target] of [
+  ["future existing room", 2, 9999],
+  ["future absent room", 0, 9999],
+  ["ordinary room", 2, 0],
+  ["valid permalink", 2, 2],
+]) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const room = `cursor-${initial}-${target}-${Date.now().toString(36)}`;
+  const errors = [], cursors = [];
+  page.on("pageerror", e => errors.push(e.message));
+  page.on("request", request => {
+    const url = new URL(request.url());
+    if (url.pathname === `/r/${room}` && request.method() === "GET") {
+      cursors.push(Number(url.searchParams.get("since")));
+    }
+  });
+  for (let n = 1; n <= initial; n++) {
+    const response = await context.request.post(`${BASE}/r/${room}`, {
+      data: { from: "cursor-test", text: `initial message ${n}` },
+    });
+    if (!response.ok()) throw new Error(`cursor fixture failed: ${await response.text()}`);
+  }
+  const firstResponse = page.waitForResponse(response =>
+    new URL(response.url()).pathname === `/r/${room}` && response.request().method() === "GET");
+  await page.goto(`${BASE}/humans#r/${room}${target ? `/${target}` : ""}`,
+                  { waitUntil: "domcontentloaded" });
+  const first = await (await firstResponse).json();
+  if (target === 9999) {
+    check(`${label}: initial empty page corrects the cursor`,
+          first.count === 0 && first.last_seq === initial);
+    await page.getByText("message 9999 has not been posted yet", { exact: true })
+      .waitFor({ timeout: 5000 });
+  } else {
+    await page.locator("#log .msg").first().waitFor({ timeout: 5000 });
+    check(`${label}: initial messages are visible`,
+          (await page.locator("#log .msg .body").allTextContents())
+            .includes(`initial message ${initial}`));
+  }
+  const nextText = `message after ${label}`;
+  const written = await context.request.post(`${BASE}/r/${room}`, {
+    data: { from: "cursor-test", text: nextText },
+  });
+  if (!written.ok()) throw new Error(`cursor follow-up failed: ${await written.text()}`);
+  const arrived = await page.locator("#log .msg .body")
+    .filter({ hasText: nextText }).waitFor({ timeout: 8000 }).then(() => true, () => false);
+  check(`${label}: the next message appears without reopening`, arrived);
+  check(`${label}: a follow-up read uses the server checkpoint`,
+        cursors.slice(1).includes(initial), JSON.stringify(cursors));
+  check(`${label}: no page errors`, errors.length === 0, errors.join("; "));
+  await context.close();
+}
+
 await browser.close();
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

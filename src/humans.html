@@ -1170,7 +1170,10 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
           gap.textContent = '… older messages were dropped (ring retention) …';
           log.appendChild(gap);
         }
-        if (view.messages.length) { render(view.messages); since = view.last_seq; }
+        if (view.messages.length) render(view.messages);
+        // Even an empty page can correct a cursor past the room's head. Ignoring that
+        // checkpoint strands a future permalink and hides every new message behind it.
+        since = view.last_seq;
         // A shared permalink can point past both rings: the DOM keeps 200 rows and the
         // server keeps ~10 MiB. Say so in plain text rather than showing an empty room and
         // letting the reader think the link was wrong.
