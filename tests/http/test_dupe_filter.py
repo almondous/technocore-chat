@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import _client
+import httpx2 as httpx
 import pytest
 from _client import _keypair, _post_signed, _say_signed
 
@@ -81,19 +82,59 @@ def _say(client, room: str, nick: str, text: str, ref: str = ""):
     return client.get(url + ("?ref=" + ref if ref else ""))
 
 
-def test_the_sixth_copy_from_a_different_sender_is_refused(client) -> None:
+def _ref(body: str) -> re.Match[str]:
+    found = re.search(r"&ref=(422-[0-9a-f]+-[0-9a-f]{4})(?=\s|$)", body)
+    assert found, body
+    return found
+
+
+def _assert_duplicate_kind(response: httpx.Response) -> None:
+    assert response.status_code == 422
+    assert "retry-after" not in response.headers
+    ref = _ref(response.text)
+    # The ref's timestamp and random suffix are opaque data, not rate-limit advice.
+    # Check all the prose, including anything after the ref, without interpreting its digits.
+    advice = response.text[: ref.start(1)] + response.text[ref.end(1) :]
+    assert "429" not in advice
+
+
+@pytest.mark.parametrize(
+    "second,suffix",
+    [(0x6AC42A00, "8b15"), (0x6AC42996, "8b15"), (0x6AC42A00, "4290")],
+    ids=["ordinary-ref", "timestamp-contains-429", "random-contains-429"],
+)
+def test_the_sixth_copy_from_a_different_sender_is_refused(
+    client, monkeypatch, second, suffix
+) -> None:
     """The case the whole filter exists for. Five senders may say the same thing; the
     sixth is a copy, and refusing it is the point - a 200 here would have to carry a
     record of the refuser's that does not exist."""
+    monkeypatch.setattr("app.time.time", lambda: second)
+    monkeypatch.setattr("app.secrets.token_hex", lambda n: suffix)
     with _filter_on():
         for i in range(COPIES):
             assert _say(client, "lobby", "nick" + str(i), PHRASE).status_code == 200
         sixth = _say(client, "lobby", "someone-else", PHRASE)
-    assert sixth.status_code == 422
+    assert _ref(sixth.text).group(1) == f"422-{second:x}-{suffix}"
+    _assert_duplicate_kind(sixth)
     assert "/patterns.md" in sixth.text and "lobby" in sixth.text
     assert "rephrase" not in sixth.text and "short" not in sixth.text  # no escape hatch
-    assert "429" not in sixth.text and "retry-after" not in sixth.headers
     assert len(_view(client)) == COPIES, "the refused copy must not land"
+
+
+@pytest.mark.parametrize(
+    "status,headers,before,after",
+    [
+        (429, {}, "", ""),
+        (422, {"Retry-After": "1"}, "", ""),
+        (422, {}, "429 rate limited\n", ""),
+        (422, {}, "", "\n429 retry later"),
+    ],
+)
+def test_the_duplicate_kind_check_still_rejects_rate_limit_answers(status, headers, before, after):
+    body = f"{before}422 duplicate text\noptional: add &ref=422-6ac42996-4290 to your next requests.{after}"
+    with pytest.raises(AssertionError):
+        _assert_duplicate_kind(httpx.Response(status, headers=headers, text=body))
 
 
 def test_a_refusal_is_counted_and_logged_so_the_advice_can_be_measured(client, capsys) -> None:
@@ -127,8 +168,7 @@ def test_the_ref_token_is_handed_out_seen_again_and_never_a_way_past_the_filter(
         assert _say(client, "lobby", "a", PHRASE).status_code == 200
         refused = _say(client, "lobby", "b", PHRASE)
     assert refused.status_code == 422
-    handed = re.search(r"&ref=(422-[0-9a-f]+-[0-9a-f]{4})", refused.text)
-    assert handed, refused.text
+    handed = _ref(refused.text)
     ref = handed.group(1)
     assert "422-" + format(int(time.time()), "x")[:5] in ref, "the token carries its issue second"
     before = limit._requests["followed"]
