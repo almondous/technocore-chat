@@ -645,8 +645,13 @@ const browser = await chromium.launch({
 
 // ------------------------------------------------------------ identity changes while signing
 // Hold a real WebCrypto result so signing out or replacing the identity happens before
-// send's continuation runs. The already-started message must keep its original signer.
-for (const change of ["unchanged", "signed out", "replaced"]) {
+// send's continuation runs. The already-started message must keep its original signer
+// and room; completing it must preserve a draft now displayed in another room.
+for (const moved of [false, true]) for (const change of ["unchanged", "signed out", "replaced"]) {
+  const label = `identity ${change}${moved ? " after room switch" : ""}`;
+  const sentRoom = moved ? `pending${Date.now().toString(36)}` : "lobby";
+  const nextRoom = moved ? `${sentRoom}next` : sentRoom;
+  const nextDraft = "a draft for the other room";
   const context = await browser.newContext({ viewport: { width: 900, height: 900 } });
   const page = await context.newPage();
   const errors = [];
@@ -658,7 +663,7 @@ for (const change of ["unchanged", "signed out", "replaced"]) {
   await page.click("#keyuse");
   const original = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
   await page.waitForFunction((did) => document.getElementById("me").title === did, original);
-  await page.fill("#room", "lobby");
+  await page.fill("#room", sentRoom);
   await page.click("#join");
 
   await page.evaluate(() => {
@@ -673,18 +678,18 @@ for (const change of ["unchanged", "signed out", "replaced"]) {
     window.__signedPost = null;
     window.fetch = (url, init) => {
       if (init?.method !== "POST") return realFetch(url, init);
-      const post = window.__signedPost = { payload: JSON.parse(init.body), status: null };
+      const post = window.__signedPost = { url: String(url), payload: JSON.parse(init.body), status: null };
       return realFetch(url, init).then((response) => {
         post.status = response.status;
         return response;
       }, (error) => { post.error = String(error); throw error; });
     };
   });
-  const text = `identity ${change} while signing ${Date.now()}`;
+  const text = `${label} while signing ${Date.now()}`;
   await page.fill("#text", text);
   await page.click("#send");
   await page.waitForFunction(() => typeof window.__releaseSignature === "function");
-  check(`identity ${change}: the signed request is held`,
+  check(`${label}: the signed request is held`,
         (await page.evaluate(() => window.__signedPost)) === null);
 
   let current = original;
@@ -702,6 +707,11 @@ for (const change of ["unchanged", "signed out", "replaced"]) {
       current = await page.getAttribute("#me", "title");
     }
   }
+  if (moved) {
+    await page.fill("#room", nextRoom);
+    await page.click("#join");
+    await page.fill("#text", nextDraft);
+  }
   await page.evaluate(() => new Promise((resolve) => {
     // The next task runs after send's promise reactions, including its catch. This also
     // finishes promptly on the broken sign-out path, which never reaches fetch at all.
@@ -716,16 +726,27 @@ for (const change of ["unchanged", "signed out", "replaced"]) {
     await page.waitForFunction(() => window.__signedPost.status !== null || window.__signedPost.error,
                                null, { timeout: 5000 });
   const post = await page.evaluate(() => window.__signedPost);
-  check(`identity ${change}: the POST keeps the original DID`, post?.payload.did === original);
-  check(`identity ${change}: the server accepts the original signature`, post?.status === 200,
+  check(`${label}: the POST keeps the original room`, post?.url === `/r/${sentRoom}`, post?.url);
+  check(`${label}: the POST keeps the original DID`, post?.payload.did === original);
+  check(`${label}: the server accepts the original signature`, post?.status === 200,
         post ? JSON.stringify(post.status) : await page.textContent("#status"));
-  const messages = (await (await fetch(`${BASE}/r/lobby?format=json`)).json()).messages;
-  check(`identity ${change}: the stored message belongs to the original signer`,
+  const messages = (await (await fetch(`${BASE}/r/${sentRoom}?format=json`)).json()).messages;
+  check(`${label}: the stored message belongs to the original signer`,
         messages.filter((m) => m.text === text).length === 1 &&
         messages.find((m) => m.text === text)?.from === original);
-  check(`identity ${change}: completion preserves the current identity`, current
+  check(`${label}: completion preserves the current identity`, current
         ? (await page.getAttribute("#me", "title")) === current
         : (await page.textContent("#me")) === "Not signed in");
+
+  check(`${label}: completion stays in the displayed room`,
+        (await page.inputValue("#room")) === nextRoom);
+  check(`${label}: completion preserves another room's draft`,
+        (await page.inputValue("#text")) === (moved ? nextDraft : ""));
+  if (moved) {
+    const elsewhere = await (await fetch(`${BASE}/r/${nextRoom}?format=json`)).json();
+    check(`${label}: the new room has no copy of the pending message`,
+          !elsewhere.messages.some((message) => message.text === text));
+  }
 
   if (change === "replaced") {
     const next = `${text} next send`;
@@ -734,13 +755,13 @@ for (const change of ["unchanged", "signed out", "replaced"]) {
     await page.waitForFunction((text) => window.__signedPost?.payload.text === text &&
       (window.__signedPost.status !== null || window.__signedPost.error), next, { timeout: 5000 });
     const later = await page.evaluate(() => window.__signedPost);
-    check("identity replaced: the next send uses the new signer",
-          later.payload.did === current && later.status === 200);
-    const view = await (await fetch(`${BASE}/r/lobby?format=json`)).json();
-    check("identity replaced: the next message is stored under the new DID",
+    check(`${label}: the next send uses the new signer and current room`,
+          later.payload.did === current && later.url === `/r/${nextRoom}` && later.status === 200);
+    const view = await (await fetch(`${BASE}/r/${nextRoom}?format=json`)).json();
+    check(`${label}: the next message is stored under the new DID`,
           view.messages.find((m) => m.text === next)?.from === current);
   }
-  check(`identity ${change}: no page errors`, errors.length === 0, errors.join("; "));
+  check(`${label}: no page errors`, errors.length === 0, errors.join("; "));
   await context.close();
 }
 

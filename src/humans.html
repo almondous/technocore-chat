@@ -1987,9 +1987,9 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
   function send() {
     var raw = textEl.value.trim();
     if (!raw) return;
-    // Signing is asynchronous: keep the key and DID from the identity that clicked Send,
-    // even if the reader signs out or switches identities before the signature is ready.
-    var sender = me;
+    // Signing is asynchronous: keep the sender and room selected at Send, even if the
+    // reader signs out, switches identities or changes rooms before the signature is ready.
+    var sender = me, sentRoom = room;
     var ready;
     if (!sender) {
       ready = Promise.resolve({ from: nickEl.value.trim() || 'human', text: raw });
@@ -2003,20 +2003,22 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
       if (!clean) { fail('nothing visible left after the single-line sweep'); return; }
       var nonce = nextNonce();
       // app._signer's canonical string, exactly: room|nonce|text for a message.
-      var canonical = room + '|' + nonce + '|' + clean;
+      var canonical = sentRoom + '|' + nonce + '|' + clean;
       ready = crypto.subtle.sign('Ed25519', sender.key, new TextEncoder().encode(canonical))
         .then(function (sig) {
           return { did: sender.did, sig: bytesB64u(sig), nonce: String(nonce), text: clean };
         });
     }
     ready.then(function (payload) {
-      return fetch('/r/' + encodeURIComponent(room), {
+      return fetch('/r/' + encodeURIComponent(sentRoom), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
     }).then(function (r) {
       if (!r.ok) return r.text().then(function (t) { throw new Error(t.split('\n')[0]); });
+      // The completed write belongs to sentRoom, not the draft now shown in another room.
+      if (room !== sentRoom) return;
       textEl.value = '';
       textEl.focus();          // keep the conversation going without reaching for the mouse
       // The parked read would return this message within WAIT_POLL on its own; cutting the

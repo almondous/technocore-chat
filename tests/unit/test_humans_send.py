@@ -1,4 +1,4 @@
-"""Execute the page's send path with a real signature held across an identity change.
+"""Execute the page's send path with a real signature held across identity/room changes.
 
 Node supplies WebCrypto; the browser probe separately exercises the visible controls and
 server acceptance. The gate makes the race deterministic without a timing-sensitive sleep.
@@ -20,6 +20,7 @@ import { webcrypto } from 'node:crypto';
 import vm from 'node:vm';
 
 const mode = process.argv[1];
+const moveRoom = process.argv[2] === 'move';
 const html = readFileSync('src/humans.html', 'utf8');
 const send = html.match(/  function send\(\) \{[\s\S]*?\n  \}/)?.[0];
 const logout = html.match(/keyOutEl\.addEventListener\('click', function \(\) \{([\s\S]*?)\n  \}\);/)?.[1];
@@ -55,6 +56,7 @@ const env = {
   } } },
   fetch: async (url, options) => {
     posts.push({ url, options, payload: JSON.parse(options.body) });
+    setImmediate(settled); // Observe completion even when the UI has moved to another room.
     return { ok: true };
   },
   fail: message => { errors.push(message); settled(); },
@@ -66,6 +68,10 @@ vm.runInContext(send + '\nsend();', env);
 await signing;
 if (mode !== 'unchanged') vm.runInContext(logout, env);
 if (mode === 'switch') env.me = replacement;
+if (moveRoom) {
+  env.room = 'otherroom';
+  env.textEl.value = 'a draft for the other room';
+}
 assert.equal(posts.length, 0, 'no write before signing completes');
 release();
 await done;
@@ -83,16 +89,21 @@ assert.equal(await webcrypto.subtle.verify('Ed25519', original.publicKey, signat
 assert.equal(await webcrypto.subtle.verify('Ed25519', replacement.publicKey, signature, canonical), false);
 assert.equal(env.me, mode === 'unchanged' ? original : mode === 'switch' ? replacement : null,
              'finishing the send must not restore the previous identity');
+assert.equal(env.room, moveRoom ? 'otherroom' : 'identityprobe',
+             'finishing the send must not navigate back to the previous room');
+assert.equal(env.textEl.value, moveRoom ? 'a draft for the other room' : '',
+             'only a completed send in the displayed room clears its composer');
 clearTimeout(watchdog);
 """
 
 
 @pytest.mark.skipif(NODE is None, reason="Node is needed to execute the page's send path")
 @pytest.mark.parametrize("mode", ["unchanged", "logout", "switch"])
-def test_pending_send_keeps_the_identity_that_started_it(mode):
+@pytest.mark.parametrize("navigation", ["stay", "move"])
+def test_pending_send_keeps_the_identity_and_room_that_started_it(mode, navigation):
     assert NODE is not None
     result = subprocess.run(
-        [NODE, "--input-type=module", "-e", PROBE, mode],
+        [NODE, "--input-type=module", "-e", PROBE, mode, navigation],
         cwd=ROOT,
         capture_output=True,
         text=True,
