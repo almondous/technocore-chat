@@ -532,6 +532,87 @@ const browser = await chromium.launch({
   await context.close();
 }
 
+// ----------------------------------------------------------- resolved permalink scrolling
+{
+  const context = await browser.newContext({ viewport: { width: 900, height: 900 } });
+  const page = await context.newPage();
+  const room = `permalink-scroll-${Date.now().toString(36)}`;
+  const errors = [];
+  page.on("pageerror", error => errors.push(error.message));
+  const write = async text => {
+    const response = await context.request.post(`${BASE}/r/${room}`, {
+      data: { from: "scroll-probe", text },
+    });
+    if (!response.ok()) throw new Error(`scroll fixture failed: ${await response.text()}`);
+  };
+  for (let n = 1; n <= 4; n++) {
+    await write(`initial ${n}: ${"A message tall enough to scroll past. ".repeat(8)}`);
+  }
+  await page.goto(`${BASE}/humans#r/${room}/1`, { waitUntil: "domcontentloaded" });
+  await page.locator("#log .msg.target .seq").filter({ hasText: "#1" }).waitFor();
+  check("permalink: the initial target is highlighted", await page.locator(".msg.target").isVisible());
+  // As in the live-log check above, size from the content rather than a font assumption.
+  await page.evaluate(() => {
+    const log = document.getElementById("log");
+    log.style.minHeight = "0";
+    log.style.maxHeight = Math.max(40, log.scrollHeight / 3) + "px";
+  });
+  const scrollAway = () => page.evaluate(() => {
+    const log = document.getElementById("log");
+    log.scrollTop = Math.floor((log.scrollHeight - log.clientHeight) / 2);
+    return log.scrollTop;
+  });
+  const position = () => page.evaluate(() => {
+    const log = document.getElementById("log");
+    return { top: log.scrollTop, bottom: log.scrollHeight - log.clientHeight };
+  });
+  const arrive = async text => {
+    await write(text);
+    await page.locator("#log .msg .body").filter({ hasText: text }).waitFor({ timeout: 15000 });
+  };
+  const before = await scrollAway();
+  check("permalink: history is scrollable", before > 40);
+  await arrive("message after reading away from the permalink");
+  check("permalink: an arrival preserves the reader's position",
+        Math.abs((await position()).top - before) < 1);
+  const jump = page.locator("#jump");
+  const offered = await jump.isVisible();
+  check("permalink: the arrival is offered in the new-message pill", offered);
+  // Still collect the later checks on an unfixed page whose pill never appears.
+  if (offered) await jump.click();
+  else await page.evaluate(() => {
+    const log = document.getElementById("log"); log.scrollTop = log.scrollHeight;
+  });
+  await arrive("message after jumping to latest");
+  const latest = await position();
+  check("permalink: latest follows later arrivals", Math.abs(latest.top - latest.bottom) < 1);
+  check("permalink: its highlight survives leaving the target",
+        (await page.locator("#log .msg.target .seq").textContent()) === "#1");
+
+  // A new hash in the same room is another explicit navigation and must position once.
+  await page.evaluate(hash => { location.hash = hash; }, `#r/${room}/2`);
+  await page.waitForFunction(() =>
+    document.querySelector("#log .msg.target .seq")?.textContent === "#2");
+  check("permalink: a new same-room target is highlighted",
+        (await page.locator("#log .msg.target .seq").textContent()) === "#2");
+  const nextBefore = await scrollAway();
+  await arrive("message after leaving the second permalink");
+  check("permalink: the new target also releases scroll control",
+        Math.abs((await position()).top - nextBefore) < 1);
+  check("permalink: later arrivals keep the selected hash",
+        (await page.evaluate(() => location.hash)) === `#r/${room}/2`);
+
+  await page.evaluate(hash => { location.hash = hash; }, `#r/${room}`);
+  await page.waitForFunction(() =>
+    document.querySelectorAll("#log .msg").length > 0
+    && !document.querySelector("#log .msg.target"));
+  const ordinary = await position();
+  check("permalink: returning to the room tail follows latest",
+        Math.abs(ordinary.top - ordinary.bottom) < 1);
+  check("permalink: no page errors", errors.length === 0, errors.join("; "));
+  await context.close();
+}
+
 // ---------------------------------------------------------------------------- signing
 // The did:key lane, which is the one part of this page a Python test can only half-check.
 // tests/unit/test_humans_identity.py pins the constants the page restates; it cannot tell

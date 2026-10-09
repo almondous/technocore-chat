@@ -1056,6 +1056,7 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
 
   var unseen = 0;         // messages that arrived while the reader was up in the history
   var firstPaint = true;  // the opening tail is not "new" and must not animate
+  var targetRevealed = false;  // a permalink positions the reader once per opening
 
   function renderJump() {
     jumpEl.hidden = unseen === 0;
@@ -1110,8 +1111,12 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
     });
     while (log.children.length > MAX_ROWS) log.removeChild(log.firstChild);
     var hit = log.querySelector('.msg.target');
-    // A permalink wins over everything: it is the one case where the reader named a message.
-    if (hit) hit.scrollIntoView({ block: 'center' });
+    // Honor the permalink once, then let the reader scroll or follow new arrivals. The
+    // highlight stays, but its presence must not keep dragging them back to that row.
+    if (hit && !targetRevealed) {
+      targetRevealed = true;
+      hit.scrollIntoView({ block: 'center' });
+    }
     else if (stick || firstPaint) toBottom();
     // Otherwise they are reading history. Count what arrived and offer the trip down rather
     // than taking it for them.
@@ -1221,7 +1226,7 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
     e.textContent = 'Nothing here yet — say something.'; log.appendChild(e);
     // Per-room, all of it: a fresh room has no unseen count to carry over, its opening tail
     // is not "new", and its first read must not park.
-    unseen = 0; firstPaint = true; primed = false; renderJump();
+    unseen = 0; firstPaint = true; targetRevealed = false; primed = false; renderJump();
     stopPoll();
     pump();
     if (roomsTimer) clearInterval(roomsTimer);
