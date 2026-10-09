@@ -1209,6 +1209,86 @@ for (const moved of [false, true]) for (const change of ["unchanged", "signed ou
   await context.close();
 }
 
+// --------------------------------------------------------------- newer drafts during a send
+// As in TSynarc's closed PR #657, hold a real write's response so the user's edits happen
+// deterministically before send() completes. Run after the other writes and timed passkey
+// checks, retaining the service's normal write limit rather than changing its configuration.
+for (const mode of ["unchanged", "edited", "restored", "out-of-order"]) {
+  const context = await browser.newContext({ viewport: { width: 900, height: 900 } });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(String(error)));
+  await page.goto(`${BASE}/humans#r/lobby`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#identity:not([hidden])", { timeout: 5000 });
+  await page.click("#keymore summary");
+  await page.fill("#seed", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+  await page.click("#keyuse");
+  const did = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+  await page.waitForFunction((did) => document.getElementById("me").title === did, did);
+  await page.evaluate(() => {
+    const realFetch = window.fetch.bind(window);
+    window.__draftPosts = [];
+    window.fetch = (url, options) => {
+      if (options?.method !== "POST") return realFetch(url, options);
+      const post = { url: String(url), payload: JSON.parse(options.body) };
+      window.__draftPosts.push(post);
+      return realFetch(url, options).then((response) => new Promise((resolve) => {
+        post.status = response.status;
+        post.release = () => resolve(response);
+      }));
+    };
+  });
+  const original = `pending draft ${mode} ${Date.now()}`;
+  await page.fill("#text", original);
+  await page.click("#send");
+  await page.waitForFunction(() => typeof window.__draftPosts[0]?.release === "function");
+  const posted = await page.evaluate(() => {
+    const { status, payload } = window.__draftPosts[0];
+    return { status, payload };
+  });
+  check(`draft ${mode}: the original signed write succeeded`,
+        posted.status === 200 && posted.payload.did === did && posted.payload.text === original,
+        `HTTP ${posted.status}`);
+
+  async function release(index) {
+    await page.evaluate((index) => {
+      window.__draftPosts[index].release();
+      // A task runs after the response's promise chain has cleared or preserved the draft.
+      return new Promise((resolve) => setTimeout(resolve, 0));
+    }, index);
+  }
+  let expected = "";
+  if (mode === "edited" || mode === "restored") {
+    await page.fill("#text", `${original} edited`);
+    expected = mode === "restored" ? original : `${original} edited`;
+    if (mode === "restored") await page.fill("#text", original);
+  } else if (mode === "out-of-order") {
+    await page.fill("#text", `${original} second`);
+    await page.click("#send");
+    await page.waitForFunction(() => typeof window.__draftPosts[1]?.release === "function");
+    check("draft out-of-order: the second signed write succeeded",
+          (await page.evaluate(() => window.__draftPosts[1].status)) === 200);
+    await release(1);
+    check("draft out-of-order: the second response clears its own draft",
+          (await page.inputValue("#text")) === "");
+    expected = `${original} third, unsent`;
+    await page.fill("#text", expected);
+  }
+  await page.focus("#room");
+  check(`draft ${mode}: another visible field has focus before completion`,
+        await page.evaluate(() => document.activeElement.id === "room"));
+  await release(0);
+  check(`draft ${mode}: completion preserves only newer unsent work`,
+        (await page.inputValue("#text")) === expected);
+  check(`draft ${mode}: completion focuses only its unchanged composer`,
+        await page.evaluate((mode) => document.activeElement.id ===
+          (mode === "unchanged" ? "text" : "room"), mode));
+  const messages = (await (await fetch(`${BASE}/r/lobby?format=json`)).json()).messages;
+  check(`draft ${mode}: the original message is stored once`,
+        messages.filter((message) => message.text === original && message.from === did).length === 1);
+  check(`draft ${mode}: no page errors`, errors.length === 0, errors.join("; "));
+  await context.close();
+}
 
 await browser.close();
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");

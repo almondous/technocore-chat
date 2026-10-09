@@ -740,7 +740,7 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
   var jumpEl = document.getElementById('jump'), liveEl = document.getElementById('live');
   var roomsBody = document.querySelector('#rooms tbody'), statsEl = document.getElementById('stats');
   var filterEl = document.getElementById('filter');
-  var room = 'lobby', since = 0, roomsTimer = null, targetSeq = 0;
+  var room = 'lobby', since = 0, roomsTimer = null, targetSeq = 0, draftRevision = 0;
   // The last /rooms payload, kept so the filter can re-render without a fetch. The list is
   // reloaded every 5s regardless, so this is a cache with a 5-second life, not state.
   // Not `view`: the pump already binds that name to its own payload.
@@ -1985,7 +1985,7 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
   }
 
   function send() {
-    var raw = textEl.value.trim();
+    var draft = textEl.value, raw = draft.trim(), sentRevision = draftRevision;
     if (!raw) return;
     // Signing is asynchronous: keep the sender and room selected at Send, even if the
     // reader signs out, switches identities or changes rooms before the signature is ready.
@@ -2019,8 +2019,12 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
       if (!r.ok) return r.text().then(function (t) { throw new Error(t.split('\n')[0]); });
       // The completed write belongs to sentRoom, not the draft now shown in another room.
       if (room !== sentRoom) return;
-      textEl.value = '';
-      textEl.focus();          // keep the conversation going without reaching for the mouse
+      // An edit, even one undone back to the sent text, starts a newer unsent draft.
+      // Only the unchanged draft belongs to this response; leave newer work and focus alone.
+      if (draftRevision === sentRevision && textEl.value === draft) {
+        textEl.value = '';
+        textEl.focus();
+      }
       // The parked read would return this message within WAIT_POLL on its own; cutting the
       // park short just removes that last half second for the person who sent it.
       stopPoll(); pump();
@@ -2039,6 +2043,7 @@ GET /kv/topic/&lt;room&gt;/set/&lt;text&gt;    what a room is for — shown abov
   });
   document.getElementById('join').addEventListener('click', function () { open(roomEl.value); });
   document.getElementById('send').addEventListener('click', send);
+  textEl.addEventListener('input', function () { draftRevision += 1; });
   textEl.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') send(); });
   roomEl.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') open(roomEl.value); });
 

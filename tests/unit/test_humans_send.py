@@ -43,7 +43,7 @@ const done = new Promise(resolve => { settled = resolve; });
 const posts = [], errors = [];
 const env = {
   TextEncoder, Promise, String, encodeURIComponent,
-  me: original, room: 'identityprobe',
+  me: original, room: 'identityprobe', draftRevision: 0,
   textEl: { value: 'hello', focus() {} }, nickEl: { value: 'guest' },
   swept: value => value, nextNonce: () => 123,
   bytesB64u: value => Buffer.from(value).toString('base64url'),
@@ -104,6 +104,121 @@ def test_pending_send_keeps_the_identity_and_room_that_started_it(mode, navigati
     assert NODE is not None
     result = subprocess.run(
         [NODE, "--input-type=module", "-e", PROBE, mode, navigation],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+DRAFT_PROBE = r"""
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+
+const mode = process.argv[1];
+const html = readFileSync('src/humans.html', 'utf8');
+const send = html.match(/  function send\(\) \{[\s\S]*?\n  \}/)?.[0];
+const initial = html.match(/  var room = 'lobby'[^\n]+/)?.[0];
+const input = html.match(/  textEl\.addEventListener\('input', [^\n]+/)?.[0] || '';
+assert.ok(send && initial, 'execute the actual composer state and send handler');
+const handlers = {}, posts = [], errors = [];
+let focuses = 0, polls = 0;
+const env = {
+  Promise, String, encodeURIComponent, me: null,
+  textEl: {
+    value: '  original draft  ',
+    focus() { focuses++; },
+    addEventListener(type, callback) { handlers[type] = callback; },
+  },
+  nickEl: { value: 'guest' },
+  fetch(url, options) {
+    return new Promise((resolve, reject) => {
+      posts.push({ url, payload: JSON.parse(options.body), resolve, reject });
+    });
+  },
+  stopPoll() {}, pump() { polls++; }, fail(message) { errors.push(message); },
+};
+vm.createContext(env);
+vm.runInContext(initial + '\n' + input + '\n' + send, env);
+const tick = () => new Promise(resolve => setImmediate(resolve));
+function edit(value) {
+  env.textEl.value = value;
+  handlers.input?.();
+}
+async function click() { vm.runInContext('send();', env); await tick(); }
+async function finish(index, ok = true) {
+  posts[index].resolve({ ok, text: async () => 'request refused\n' });
+  await tick();
+}
+await click();
+assert.equal(posts[0].url, '/r/lobby');
+assert.equal(posts[0].payload.text, 'original draft', 'wire text remains trimmed');
+
+let expected = '', expectedFocuses = 1, expectedPolls = 1;
+if (mode === 'edited' || mode === 'refused' || mode === 'network') {
+  edit('newer draft'); expected = 'newer draft'; expectedFocuses = 0;
+} else if (mode === 'restored') {
+  edit('temporary'); edit('  original draft  ');
+  expected = '  original draft  '; expectedFocuses = 0;
+} else if (mode === 'programmatic') {
+  env.textEl.value = 'replacement without an input event';
+  expected = env.textEl.value; expectedFocuses = 0;
+} else if (mode === 'other-room' || mode === 'returned-room') {
+  env.room = 'elsewhere'; edit('another room draft');
+  if (mode === 'returned-room') { env.room = 'lobby'; edit('newer lobby draft'); }
+  expected = env.textEl.value; expectedFocuses = 0;
+  expectedPolls = mode === 'other-room' ? 0 : 1;
+} else if (mode === 'out-of-order') {
+  edit('second message'); await click();
+  assert.equal(posts[1].payload.text, 'second message');
+  await finish(1);
+  assert.equal(env.textEl.value, '', 'the latest successful send clears its own draft');
+  edit('third, still unsent'); expected = env.textEl.value; expectedPolls = 2;
+} else if (mode === 'duplicate-completion') {
+  await click();
+  await finish(1);
+  assert.equal(env.textEl.value, '');
+  edit('  original draft  '); expected = env.textEl.value; expectedPolls = 2;
+}
+
+if (mode === 'network') {
+  posts[0].reject(new Error('offline')); await tick(); expectedPolls = 0;
+} else {
+  await finish(0, mode !== 'refused');
+  if (mode === 'refused') expectedPolls = 0;
+}
+assert.equal(env.textEl.value, expected, 'completion must not erase a newer unsent draft');
+assert.equal(focuses, expectedFocuses, 'a stale completion must not steal focus');
+assert.equal(polls, expectedPolls, 'a successful send refreshes only its displayed room');
+assert.deepEqual(errors, mode === 'network' ? ['offline']
+                        : mode === 'refused' ? ['request refused'] : []);
+assert.equal(posts.length, ['out-of-order', 'duplicate-completion'].includes(mode) ? 2 : 1,
+             'completion must never re-send a draft');
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="Node is needed to execute the page's send path")
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "unchanged",
+        "edited",
+        "restored",
+        "programmatic",
+        "other-room",
+        "returned-room",
+        "out-of-order",
+        "duplicate-completion",
+        "refused",
+        "network",
+    ],
+)
+def test_pending_send_only_clears_its_own_draft_revision(mode):
+    assert NODE is not None
+    result = subprocess.run(
+        [NODE, "--input-type=module", "-e", DRAFT_PROBE, mode],
         cwd=ROOT,
         capture_output=True,
         text=True,
