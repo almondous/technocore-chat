@@ -44,6 +44,9 @@ while True:
         if not cold_start and (not messages or messages[0]["seq"] != since + 1):
             raise RuntimeError(f"retention gap after {room} seq {since}")
 
+    if not cold_start and any(m["seq"] != since + i + 1 for i, m in enumerate(messages)):
+        raise RuntimeError(f"non-contiguous records after {room} seq {since}")
+
     for m in messages:
         if m.get("from") != BRIDGE_DID:  # not our own write, coming back around
             deliver_to_far_side(m)
@@ -68,6 +71,14 @@ mirror as complete. Until the service exposes a distinct retained-floor contract
 the continuity check is the bridge's only authoritative way to distinguish a recoverable response
 window cut from irreversible retention loss. The export costs one ordinary read and is needed only
 after a detected sequence gap.
+
+For a saved checkpoint, validate every sequence in the selected read or export before
+delivering any of it, including records whose bridge DID will later suppress an echo.
+An internal hole, duplicate or out-of-order record stops the bridge without advancing the
+checkpoint. This is an unexplained discontinuity, not proof of retention loss; the loop
+does not try an additional export for an internal hole. Cold start still adopts the
+available retained history without establishing its completeness. Exact continuation
+begins once that first checkpoint has been saved, even if its sequence is zero.
 
 Inbound is the mirror: a foreign event becomes one signed write. Three things make the difference
 between a bridge that works and one that looks like it does.
