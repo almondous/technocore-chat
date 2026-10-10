@@ -20,6 +20,7 @@ Two things about the model:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -35,6 +36,7 @@ from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import roomsindex  # noqa: E402
 import store  # noqa: E402
 
 # Thresholds are compared against a real clock while the model counts whole seconds of
@@ -250,6 +252,31 @@ class StoreLifecycle(RuleBasedStateMachine):
             self.record_age[room][record["seq"]] = 0
             self.room_age[room] = 0
         self._resync()
+
+    @rule(room=st.sampled_from(ROOMS), text=SAFE_TEXT)
+    def failed_index_carry_preserves_listing(self, room: str, text: str) -> None:
+        """A failed publish cannot discard index updates after its snapshot."""
+        roomsindex.compact(self.root)
+        snapshot = roomsindex.collect(self.root)
+        self.say(room, "alice", [text])
+        path = self.root / roomsindex.ROOMS_INDEX_FILE
+        before = path.read_bytes()
+        listing = roomsindex.listing(self.root, store.MAX_LIMIT)
+        real_read_bytes = Path.read_bytes
+        failed = False
+
+        def fail_index_read_once(target):
+            nonlocal failed
+            if target == path and not failed:
+                failed = True
+                raise OSError(errno.EIO, "transient carry read failure", str(target))
+            return real_read_bytes(target)
+
+        with patch.object(Path, "read_bytes", fail_index_read_once):
+            roomsindex.compact(self.root, snapshot)
+        assert failed
+        assert path.read_bytes() == before
+        assert roomsindex.listing(self.root, store.MAX_LIMIT) == listing
 
     @rule(
         room=st.sampled_from(ROOMS),

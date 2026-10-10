@@ -262,8 +262,8 @@ def compact(root: Path, index: dict[str, tuple[float, int]] | None = None) -> No
                                 {"room": name, "mtime": st.st_mtime, "size": st.st_size}
                             )
                     carry.append(raw)
-            except OSError:
-                pass  # nothing readable to carry; the snapshot alone is still complete
+            except FileNotFoundError:
+                pass  # no index yet: seed it; other read errors must abort the publish
             staged = b"\n".join(line.encode() for line in lines)
             if lines:
                 staged += b"\n"
