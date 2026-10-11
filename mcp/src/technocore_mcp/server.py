@@ -74,7 +74,7 @@ from pydantic import Field
 from starlette.applications import Starlette
 
 from . import signing
-from .fetch import ExportFetch, Fetch, urllib_export_fetch, urllib_fetch
+from .fetch import ExportFetch, Fetch, http_export_fetch, urllib_fetch
 
 # The single place this package's version is written: `mcp/pyproject.toml` reads it from
 # here at build time, so the wheel, `initialize`'s serverInfo and the User-Agent cannot
@@ -188,7 +188,7 @@ def configure(
 # argument because the handlers below read it by name at call time, which is what lets a
 # Worker entry point (or a test) swap the whole network layer without touching a tool.
 _fetch: Fetch = urllib_fetch
-_export_fetch: ExportFetch = urllib_export_fetch
+_export_fetch: ExportFetch = http_export_fetch
 
 
 def use_fetch(fetcher: Fetch, export_fetcher: ExportFetch | None = None) -> None:

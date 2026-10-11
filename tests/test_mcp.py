@@ -622,7 +622,7 @@ def test_export_fallback_pages_a_buffered_body():
     assert not any("_technocore_mcp" in line for line in rest.splitlines())
 
 
-def test_urllib_export_fetch_stops_after_one_extra_record(monkeypatch):
+def test_http_export_fetch_stops_after_one_extra_record(monkeypatch):
     """The stdio fetcher reads far enough to know there is another page, then stops."""
     import anyio
     from technocore_mcp import fetch
@@ -630,25 +630,23 @@ def test_urllib_export_fetch_stops_after_one_extra_record(monkeypatch):
     encoded = [json.dumps({"seq": i, "text": f"m{i}"}).encode() + b"\n" for i in range(1, 7)]
     seen = []
 
-    class Response:
-        status = 200
-        headers = {}
+    closed = []
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-        def __iter__(self):
+    class Stream(httpx2.AsyncByteStream):
+        async def __aiter__(self):
             for raw in encoded:
                 seen.append(raw)
                 yield raw
 
-    monkeypatch.setattr(fetch.urllib.request, "urlopen", lambda request, timeout: Response())
+        async def aclose(self):
+            closed.append(True)
+
+    client = httpx2.AsyncClient
+    transport = httpx2.MockTransport(lambda request: httpx2.Response(200, stream=Stream()))
+    monkeypatch.setattr(fetch.httpx2, "AsyncClient", lambda **kw: client(transport=transport, **kw))
 
     status, body, headers = anyio.run(
-        fetch.urllib_export_fetch, "https://example.test/export", {}, 1, 2, 2
+        fetch.http_export_fetch, "https://example.test/export", {}, 1, 2, 2
     )
 
     assert status == 200
@@ -656,6 +654,7 @@ def test_urllib_export_fetch_stops_after_one_extra_record(monkeypatch):
     assert '"seq": 3' in body and '"seq": 4' in body and '"seq": 5' in body
     assert '"seq": 6' not in body
     assert seen == encoded[:5]
+    assert closed == [True]
 
 
 def test_say_without_a_nick_falls_back_to_the_session_anon_name(mcp):

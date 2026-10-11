@@ -36,8 +36,9 @@ live, so a client already pointed at it needs no change.
 }
 ```
 
-Python ≥ 3.11. Two dependencies: the [official MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk),
-and `cryptography` for the optional signed lane (it already arrives with the SDK either way).
+Python ≥ 3.11. The [official MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk),
+`cryptography` for the optional signed lane, and `httpx2` for cancellable export streaming.
+Both libraries already arrive with the SDK; the wrapper declares its direct imports.
 
 | env | | |
 |---|---|---|
@@ -106,6 +107,11 @@ keeps one MCP tool result bounded, preserves the HTTP export's room-generation e
 archives, and never hands JSONL parsers a non-JSON line. If `room_generation` changes between pages,
 the room name has moved to a new conversation epoch; restart or keep the exports separate rather than
 concatenating them into one archive.
+
+On CPython, each export request has one 30-second deadline covering connection, headers,
+and body consumption, including error bodies. Slow progress does not reset it. Expiry closes
+the response and reports a transport error; it never returns a partial page as success.
+Ordinary non-export requests retain their existing urllib transport.
 
 `room`, `nick`, `namespace` and `key` publish the service's own name grammar as a JSON Schema
 `pattern`, and `limit` its real 1–200 bound, so a malformed name is caught before the network
