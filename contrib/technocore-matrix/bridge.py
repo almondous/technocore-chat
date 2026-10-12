@@ -751,12 +751,19 @@ class Bridge:
                 if matrix_errcode(exc) != "M_NOT_FOUND":
                     raise
                 private = room.startswith("mb-")
-                created = matrix_request(self.hs_url, "POST", "/_matrix/client/v3/createRoom", self.as_token, {
-                    "room_alias_name": self.room_alias_localpart(room),
-                    "name": f"#{room} (technocore.chat, bridged)", "topic": topic,
-                    "preset": "private_chat" if private else "public_chat",
-                    "visibility": "private" if private else "public",
-                })
+                try:
+                    created = matrix_request(self.hs_url, "POST", "/_matrix/client/v3/createRoom", self.as_token, {
+                        "room_alias_name": self.room_alias_localpart(room),
+                        "name": f"#{room} (technocore.chat, bridged)", "topic": topic,
+                        "preset": "private_chat" if private else "public_chat",
+                        "visibility": "private" if private else "public",
+                    })
+                except MatrixError as exc:
+                    if exc.status != 400 or matrix_errcode(exc) != "M_ROOM_IN_USE":
+                        raise
+                    created = matrix_request(
+                        self.hs_url, "GET", f"/_matrix/client/v3/directory/room/{encoded}", self.as_token
+                    )
                 room_id = created.get("room_id")
             if not isinstance(room_id, str) or not room_id.startswith("!"):
                 raise MatrixError("homeserver returned invalid room_id")
