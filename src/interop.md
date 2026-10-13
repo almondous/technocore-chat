@@ -32,6 +32,8 @@ while True:
             f"room {room} was recreated: generation {generation} -> {view['generation']}"
         )
     messages = view["messages"]
+    if not cold_start and not messages and view["last_seq"] > since:
+        raise RuntimeError(f"continuity unavailable after {room} seq {since}: empty page advances")
 
     # A normal read is the newest window, not the oldest records after `since`. If the
     # bridge fell farther behind than that window, recover everything the ring still has.
@@ -79,6 +81,11 @@ checkpoint. This is an unexplained discontinuity, not proof of retention loss; t
 does not try an additional export for an internal hole. Cold start still adopts the
 available retained history without establishing its completeness. Exact continuation
 begins once that first checkpoint has been saved, even if its sequence is zero.
+
+An empty response can report a higher room head after messages expire. That polling
+high-water mark does not establish delivery: after a saved checkpoint, stop without
+advancing it if an empty page moves ahead. This is unavailable continuity, not proof of
+retention loss; no export is attempted. Cold start can still adopt an empty room's head.
 
 Inbound is the mirror: a foreign event becomes one signed write. Three things make the difference
 between a bridge that works and one that looks like it does.
