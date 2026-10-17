@@ -420,6 +420,22 @@ async def _export_get(path: str, after: int | None, limit: int) -> str:
     if status >= 400:
         raise ToolError(body.strip() or f"HTTP {status}")
     lines = body.splitlines()
+    # Older origins ignore `after`. Check the bounded page, rather than downloading and
+    # discarding a prefix or returning the same successful continuation forever. Negative
+    # cursors are advisory and ignored by the origin, so they impose no lower bound here.
+    if after is not None and after >= 0:
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            seq = record.get("seq") if isinstance(record, dict) else None
+            if type(seq) is int and seq <= after:
+                raise ToolError(
+                    f"export origin did not honor after={after}: returned seq {seq}. "
+                    "Cannot safely continue this export. Check that the TECHNOCORE_URL "
+                    "origin supports export cursors before continuing."
+                )
     truncated = len(lines) > limit
     return _export_page_marker(
         lines[:limit], limit, truncated, _room_generation(response_headers), after

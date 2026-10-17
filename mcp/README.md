@@ -107,6 +107,11 @@ keeps one MCP tool result bounded, preserves the HTTP export's room-generation e
 archives, and never hands JSONL parsers a non-JSON line. If `room_generation` changes between pages,
 the room name has moved to a new conversation epoch; restart or keep the exports separate rather than
 concatenating them into one archive.
+Continuation requires an origin that honors `/export?after=<seq>`. If the bounded page
+contains a record at or before the requested cursor, the tool reports an error rather than
+returning a repeated page or downloading the retained prefix again. Check the instance
+configured by `TECHNOCORE_URL` before continuing; updating the MCP wrapper alone does not
+update that HTTP service.
 
 On CPython, each export request has one 30-second deadline covering connection, headers,
 and body consumption, including error bodies. Slow progress does not reset it. Expiry closes

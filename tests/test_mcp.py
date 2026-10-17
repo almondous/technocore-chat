@@ -622,6 +622,259 @@ def test_export_fallback_pages_a_buffered_body():
     assert not any("_technocore_mcp" in line for line in rest.splitlines())
 
 
+@pytest.mark.parametrize("buffered", [False, True])
+def test_export_room_refuses_an_origin_that_ignores_the_cursor(mcp, monkeypatch, buffered):
+    """A separately upgraded MCP client must not archive page one forever. In particular,
+    falling back to downloading/discarding an old origin's prefix would undo the bound.
+    """
+    from technocore_mcp import fetch as transport
+
+    encoded = [json.dumps({"seq": i}).encode() + b"\n" for i in range(1, 1001)]
+    requested, consumed, closed = [], [], []
+
+    class Stream(httpx2.AsyncByteStream):
+        async def __aiter__(self):
+            for line in encoded:
+                consumed.append(line)
+                yield line
+
+        async def aclose(self):
+            closed.append(True)
+
+    def respond(request):
+        requested.append(str(request.url))
+        return httpx2.Response(200, headers={"X-Room-Generation": "7"}, stream=Stream())
+
+    client = httpx2.AsyncClient
+    mocked = httpx2.MockTransport(respond)
+
+    async def fetch(method, url, headers, body, timeout):
+        requested.append(url)
+        return 200, b"".join(encoded).decode()
+
+    monkeypatch.setattr(
+        transport.httpx2, "AsyncClient", lambda **kw: client(transport=mocked, **kw)
+    )
+    monkeypatch.setattr(mcp.module, "_fetch", fetch)
+    monkeypatch.setattr(
+        mcp.module,
+        "_export_fetch",
+        mcp.module._export_via_fetch if buffered else transport.http_export_fetch,
+    )
+    result = mcp.call("export_room", {"room": "archive", "after": 800, "limit": 2})
+
+    assert result.is_error
+    assert "did not honor after=800" in text_of(result)
+    assert "returned seq 1" in text_of(result)
+    assert "TECHNOCORE_URL" in text_of(result)
+    assert "export_truncated" not in text_of(result)
+    assert requested == [f"{mcp.module.BASE_URL}/r/archive/export?after=800"]
+    # The buffered seam already owns a whole string; the default transport must remain
+    # bounded even when the origin ignored the cursor. No retry or prefix scan is allowed.
+    assert consumed == ([] if buffered else encoded[:3])
+    assert closed == ([] if buffered else [True])
+
+
+@pytest.mark.parametrize(
+    ("after", "seqs", "refused"),
+    [
+        (None, [1, 2, 3], False),
+        (-1, [1, 2, 3], False),
+        (0, [1, 2, 3], False),
+        (2, [3, 4, 5], False),
+        (2, [], False),
+        (0, [0, 1, 2], True),
+        (2, [2, 3, 4], True),
+        (2, [3, 4, 1], True),  # A stale lookahead must not create a false continuation.
+    ],
+)
+def test_export_cursor_guard_preserves_advisory_and_honored_cursors(
+    mcp, monkeypatch, after, seqs, refused
+):
+    sent = []
+
+    async def exported(url, headers, timeout, local_after, limit):
+        sent.append((url, local_after, limit))
+        return 200, "".join(json.dumps({"seq": seq}) + "\n" for seq in seqs), {}
+
+    monkeypatch.setattr(mcp.module, "_export_fetch", exported)
+    result = mcp.call("export_room", {"room": "archive", "after": after, "limit": 2})
+
+    assert result.is_error is refused
+    assert len(sent) == 1
+    assert sent[0][1:] == (None, 2), "the transport must not scan a pre-cursor prefix"
+    if not refused:
+        page = [json.loads(line) for line in text_of(result).splitlines()]
+        assert page[0]["after"] == after
+        assert [line["seq"] for line in page if "seq" in line] == seqs[:2]
+
+
+def test_export_cursor_guard_does_not_treat_nonrecords_as_cursor_evidence(mcp, monkeypatch):
+    """This is a progress check, not a new JSONL validator or a record reserializer."""
+    lines = [
+        "not-json",
+        "[]",
+        '{"seq":null}',
+        '{"seq":true}',
+        '{"seq":1.0}',
+        '{"seq":"1"}',
+        '{"_technocore_mcp":"export_page","after":2}',
+        '{ "seq" : 3, "text": "preserve spaces" }',
+    ]
+
+    async def exported(url, headers, timeout, after, limit):
+        return 200, "\n".join(lines) + "\n", {}
+
+    monkeypatch.setattr(mcp.module, "_export_fetch", exported)
+    result = mcp.call("export_room", {"room": "archive", "after": 2})
+    assert not result.is_error
+    assert text_of(result).splitlines()[1:] == lines
+
+
+def test_export_room_refuses_repeated_pages_over_real_http(mcp, monkeypatch, tmp_path):
+    """The real SDK and async CPython transport meet an origin with the pre-cursor HTTP contract:
+    /export ignores its query and serves the whole ring on every request.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from technocore_mcp import fetch as transport
+
+    import store
+
+    # This origin is loopback-only; an ambient proxy must not replace the fixture.
+    client = httpx2.AsyncClient
+    monkeypatch.setattr(transport.httpx2, "AsyncClient", lambda **kw: client(trust_env=False, **kw))
+    for i in range(6):
+        store.append(tmp_path, "archive", "bot", f"record {i}")
+    generation, chunks = store.export_room(tmp_path, "archive")
+    body = b"".join(chunks)
+    paths = []
+
+    class OldOrigin(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            paths.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Room-Generation", str(generation))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args) -> None:
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), OldOrigin) as origin:
+        thread = threading.Thread(target=origin.serve_forever, daemon=True)
+        thread.start()
+        monkeypatch.setattr(mcp.module, "BASE_URL", f"http://127.0.0.1:{origin.server_port}")
+        monkeypatch.setattr(mcp.module, "_export_fetch", transport.http_export_fetch)
+        try:
+            first = mcp.call("export_room", {"room": "archive", "limit": 2})
+            assert not first.is_error
+            page = [json.loads(line) for line in text_of(first).splitlines()]
+            assert [line["seq"] for line in page if "seq" in line] == [1, 2]
+            assert page[-1]["after"] == 2
+
+            second = mcp.call("export_room", {"room": "archive", "after": 2, "limit": 2})
+            assert second.is_error
+            assert "did not honor after=2" in text_of(second)
+            assert "returned seq 1" in text_of(second)
+            assert paths == ["/r/archive/export", "/r/archive/export?after=2"]
+        finally:
+            origin.shutdown()
+            thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("seqs, refused", [((1, 2, 3), True), ((3, 4, 5), False)])
+def test_worker_export_refuses_a_nonadvancing_origin(mcp, monkeypatch, seqs, refused):
+    """Execute the real Worker adapter with just the platform's stream boundary faked.
+    The shared guard must reject repeats after cancellation, without a whole-body retry.
+    """
+    import importlib.util
+    from types import ModuleType, SimpleNamespace
+
+    calls = []
+    chunks = [json.dumps({"seq": seq}).encode() + b"\n" for seq in seqs]
+
+    class Reader:
+        reads = 0
+        cancelled = 0
+        released = 0
+
+        async def read(self):
+            assert self.reads < len(chunks), "read beyond the bounded probe"
+            chunk = chunks[self.reads]
+            self.reads += 1
+            return SimpleNamespace(done=False, value=chunk)
+
+        async def cancel(self):
+            self.cancelled += 1
+
+        def releaseLock(self):  # noqa: N802 - JavaScript ReadableStream interface
+            self.released += 1
+
+    reader = Reader()
+
+    class Response:
+        status = 200
+        headers = {"X-Room-Generation": "7"}
+        body = SimpleNamespace(getReader=lambda: reader)
+
+        async def text(self):
+            pytest.fail("export materialized the whole response")
+
+    async def fetch(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    workers = ModuleType("workers")
+    for name, value in {
+        "Response": object,
+        "WorkerEntrypoint": object,
+        "asgi": SimpleNamespace(),
+        "fetch": fetch,
+    }.items():
+        monkeypatch.setattr(workers, name, value, raising=False)
+    monkeypatch.setitem(sys.modules, "workers", workers)
+    # Preserve the export adapter's platform deadline while faking only the JS boundary.
+    signal = object()
+    js = ModuleType("js")
+    monkeypatch.setattr(
+        js, "AbortSignal", SimpleNamespace(timeout=lambda ms: signal), raising=False
+    )
+    monkeypatch.setitem(sys.modules, "js", js)
+    # A development machine with Cloudflare helpers must take the same lazy import path.
+    monkeypatch.setitem(sys.modules, "_cloudflare.allow_entropy", None)
+    spec = importlib.util.spec_from_file_location(
+        "worker_export_test", ROOT / "mcp" / "worker" / "src" / "worker.py"
+    )
+    assert spec is not None and spec.loader is not None
+    worker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(worker)
+
+    async def no_fallback(*args, **kwargs):
+        pytest.fail("export fell back to whole-body fetch")
+
+    monkeypatch.setattr(mcp.module, "_fetch", no_fallback)
+    monkeypatch.setattr(mcp.module, "_export_fetch", worker.workers_export_fetch)
+    result = mcp.call("export_room", {"room": "archive", "after": 2, "limit": 2})
+    assert result.is_error is refused
+    assert len(calls) == 1
+    assert calls[0][0] == f"{mcp.module.BASE_URL}/r/archive/export?after=2"
+    assert calls[0][1]["method"] == "GET"
+    assert calls[0][1]["signal"] is signal
+    assert (reader.reads, reader.cancelled, reader.released) == (3, 1, 1)
+    if refused:
+        assert "did not honor after=2" in text_of(result)
+        assert "export_truncated" not in text_of(result)
+    else:
+        parsed = [json.loads(line) for line in text_of(result).splitlines()]
+        assert parsed[0]["room_generation"] == 7
+        assert [record["seq"] for record in parsed if "seq" in record] == [3, 4]
+        assert parsed[-1]["after"] == 4
+
+
 def test_http_export_fetch_stops_after_one_extra_record(monkeypatch):
     """The stdio fetcher reads far enough to know there is another page, then stops."""
     import anyio
