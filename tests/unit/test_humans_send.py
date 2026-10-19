@@ -24,7 +24,11 @@ const moveRoom = process.argv[2] === 'move';
 const html = readFileSync('src/humans.html', 'utf8');
 const send = html.match(/  function send\(\) \{[\s\S]*?\n  \}/)?.[0];
 const logout = html.match(/keyOutEl\.addEventListener\('click', function \(\) \{([\s\S]*?)\n  \}\);/)?.[1];
-assert.ok(send && logout, 'send and sign-out handlers exist');
+// Sign-out now starts the next identity attempt, so the extracted handler needs the
+// page's real counter and ceremony guard in scope as well.
+const attemptVar = html.match(/  var identityAttempt = 0;\n/)?.[0];
+const beginIdentity = html.match(/  function beginIdentity\(\) \{[\s\S]*?\n  \}/)?.[0];
+assert.ok(send && logout && attemptVar && beginIdentity, 'send and sign-out handlers exist');
 const watchdog = setTimeout(() => { throw new Error('send did not settle'); }, 5000);
 
 async function identity() {
@@ -66,7 +70,7 @@ const env = {
 vm.createContext(env);
 vm.runInContext(send + '\nsend();', env);
 await signing;
-if (mode !== 'unchanged') vm.runInContext(logout, env);
+if (mode !== 'unchanged') vm.runInContext(attemptVar + beginIdentity + '\n' + logout, env);
 if (mode === 'switch') env.me = replacement;
 if (moveRoom) {
   env.room = 'otherroom';
