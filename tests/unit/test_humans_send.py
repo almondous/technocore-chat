@@ -70,7 +70,8 @@ const env = {
 vm.createContext(env);
 vm.runInContext(send + '\nsend();', env);
 await signing;
-if (mode !== 'unchanged') vm.runInContext(attemptVar + beginIdentity + '\n' + logout, env);
+if (mode !== 'unchanged')
+  vm.runInContext(attemptVar + 'var ceremony = null; function hold() {}\n' + beginIdentity + '\n' + logout, env);
 if (mode === 'switch') env.me = replacement;
 if (moveRoom) {
   env.room = 'otherroom';
