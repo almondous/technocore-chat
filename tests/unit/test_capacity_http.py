@@ -109,3 +109,27 @@ def test_curl_has_a_total_deadline_and_propagates_timeout(monkeypatch):
     with pytest.raises(subprocess.CalledProcessError) as exc:
         bench._get("http://127.0.0.1:1/rooms")
     assert exc.value.returncode == 28
+
+
+def test_delayed_sampler_fails_explicitly_and_is_joined(monkeypatch):
+    release = threading.Event()
+    before = set(threading.enumerate())
+
+    class DelayedSampler(threading.Thread):
+        def run(self):
+            release.wait()
+            super().run()
+
+        def join(self, timeout=None):
+            release.set()
+            super().join(timeout)
+
+    # Even the real sleeps cannot guarantee the sampler gets a turn before stop is set.
+    monkeypatch.setattr(threading, "Thread", DelayedSampler)
+    monkeypatch.setattr(bench, "_curl", lambda *args: None)
+    monkeypatch.setattr(bench, "_get", lambda url: pytest.fail("sampler should already be stopped"))
+    with pytest.raises(RuntimeError, match="no latency samples"):
+        bench._loop_stall("http://unused", ("http://unused/write",))
+
+    assert release.is_set()
+    assert not [t for t in threading.enumerate() if t not in before and not t.daemon]

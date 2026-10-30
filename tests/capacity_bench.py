@@ -498,6 +498,8 @@ def _loop_stall(base: str, write_args: tuple[str, ...]) -> float:
         thread.join()
     if errors:
         raise errors[0]
+    if not latencies:
+        raise RuntimeError("benchmark sampler collected no latency samples")
     return max(latencies)
 
 
